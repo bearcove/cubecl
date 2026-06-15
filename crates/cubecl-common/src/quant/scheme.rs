@@ -226,6 +226,11 @@ pub enum QuantStore {
 pub enum QuantMode {
     /// Symmetric or scale quantization.
     Symmetric,
+    /// Codebook (lookup-table) quantization: the stored value is an index into a
+    /// per-format centroid table, and dequant is `centroid[index] * scale`
+    /// (e.g. Lloyd-Max codebooks). Unlike [`Symmetric`](Self::Symmetric) the
+    /// stored bits are an unsigned index, not a signed integer.
+    Codebook,
 }
 
 /// Quantization floating-point precision.
