@@ -129,6 +129,9 @@ pub enum QuantValue {
     E5M2,
     /// 8-bit floating point, e4m3 format.
     E4M3,
+    /// 6-bit quantization with full range. Codes pack densely (no even u32
+    /// division), so this requires a dense store ([`QuantStore::PackedU32Dense`]).
+    Q6F,
     /// 4-bit quantization with full range.
     Q4F,
     /// 4-bit floating point, e2m1 format.
@@ -148,6 +151,7 @@ impl QuantValue {
     pub fn size_bits(&self) -> usize {
         match self {
             QuantValue::Q8F | QuantValue::Q8S | QuantValue::E4M3 | QuantValue::E5M2 => 8,
+            QuantValue::Q6F => 6,
             QuantValue::Q4F | QuantValue::Q4S | QuantValue::E2M1 => 4,
             QuantValue::Q2F | QuantValue::Q2S => 2,
         }
@@ -166,6 +170,7 @@ impl QuantValue {
     pub fn range(&self) -> (f32, f32) {
         match self {
             QuantValue::Q8F => (i8::MIN as f32, i8::MAX as f32),
+            QuantValue::Q6F => (-32.0, 31.0),
             QuantValue::Q4F => (-8.0, 7.0),
             QuantValue::Q2F => (-2.0, 1.0),
             QuantValue::Q8S => (-i8::MAX as f32, i8::MAX as f32),
@@ -180,7 +185,9 @@ impl QuantValue {
     /// If the range of values is symmetric around zero.
     pub fn is_symmetric(&self) -> bool {
         match self {
-            Self::Q8F | Self::Q4F | Self::Q2F | Self::E4M3 | Self::E5M2 | Self::E2M1 => false,
+            Self::Q8F | Self::Q6F | Self::Q4F | Self::Q2F | Self::E4M3 | Self::E5M2 | Self::E2M1 => {
+                false
+            }
             Self::Q8S | Self::Q4S | Self::Q2S => true,
         }
     }
@@ -193,17 +200,28 @@ impl QuantStore {
             QuantStore::Native => value.size_bits(),
             QuantStore::PackedNative(_) => value.size_bits() * value.native_packing(),
             QuantStore::PackedU32(_) => 32,
+            // A dense unit is the smallest run of u32 words holding a whole number
+            // of codes: lcm(code bits, 32).
+            QuantStore::PackedU32Dense(_) => lcm(value.size_bits(), 32),
         }
     }
 
     fn packing_dim(&self) -> Option<usize> {
         match self {
             QuantStore::Native => None,
-            QuantStore::PackedNative(packing_dim) | QuantStore::PackedU32(packing_dim) => {
-                Some(*packing_dim)
-            }
+            QuantStore::PackedNative(packing_dim)
+            | QuantStore::PackedU32(packing_dim)
+            | QuantStore::PackedU32Dense(packing_dim) => Some(*packing_dim),
         }
     }
+}
+
+const fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+const fn lcm(a: usize, b: usize) -> usize {
+    a / gcd(a, b) * b
 }
 
 /// Data type used to stored quantized values.
@@ -217,6 +235,13 @@ pub enum QuantStore {
     /// Store packed quantized values in a 4-byte unsigned integer.
     /// Argument is the dimension the tensor is packed on, starting from the innermost dimension.
     PackedU32(usize),
+    /// Densely bit-pack codes into a u32 stream: code `j` occupies bits
+    /// `[j*size_bits, (j+1)*size_bits)`. For widths that don't divide 32 evenly
+    /// (e.g. 6-bit), codes straddle word boundaries. One "unit" is
+    /// `lcm(size_bits, 32)` bits = `lcm/32` u32 words holding `lcm/size_bits`
+    /// codes with no straddle across the unit boundary.
+    /// Argument is the dimension the tensor is packed on, starting from the innermost dimension.
+    PackedU32Dense(usize),
     // /// Store packed quantized values in a 8-bit unsigned integer.
     // U8,
 }

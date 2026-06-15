@@ -294,7 +294,8 @@ pub fn run_with_quant_type<F: RunWithQuantType>(func: F, scheme: QuantScheme) ->
             QuantValue::Q8S => run_with_q::<F, i8>,
             QuantValue::E5M2 => run_with_q::<F, e5m2>,
             QuantValue::E4M3 => run_with_q::<F, e4m3>,
-            QuantValue::Q4F
+            QuantValue::Q6F
+            | QuantValue::Q4F
             | QuantValue::Q4S
             | QuantValue::Q2F
             | QuantValue::Q2S
@@ -302,7 +303,7 @@ pub fn run_with_quant_type<F: RunWithQuantType>(func: F, scheme: QuantScheme) ->
                 panic!("Sub-byte quantization can't be native")
             }
         },
-        QuantStore::PackedU32(_) => run_with_q::<F, u32>,
+        QuantStore::PackedU32(_) | QuantStore::PackedU32Dense(_) => run_with_q::<F, u32>,
         QuantStore::PackedNative(_) => run_with_q::<F, e2m1x2>,
     };
     run_q(func, scheme)
