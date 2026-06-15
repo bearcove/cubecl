@@ -5,28 +5,74 @@ use cubecl_core as cubecl;
 
 /// Dequantize a vector of values, where `vector_size * num_quants` is a power of two.
 /// Unaligned values can't be dequantized in place.
+///
+/// `codebook` is the comptime centroid table; it is read only for
+/// [`QuantMode::Codebook`] schemes (an empty `Codebook(&[])` is fine for symmetric).
 #[cube]
 pub fn dequantize_aligned<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF: Size>(
     value: Vector<Q, NQ>,
     scale: S,
     #[comptime] scheme: QuantScheme,
+    #[comptime] codebook: Codebook,
 ) -> Vector<F, NF> {
-    let q_values = match scheme.store {
-        QuantStore::Native | QuantStore::PackedNative(_) => Vector::<F, NF>::cast_from(value),
-        QuantStore::PackedU32(_) => unpack_cast_u32::<F, NQ, NF>(Vector::cast_from(value), scheme),
-        // Dense bit-packing is handled by cubek-quant's codebook path, not this
-        // affine helper (comptime-guarded: only reached for dense schemes).
-        QuantStore::PackedU32Dense(_) => panic!("dense packing unsupported in cubecl-std"),
-    };
-    let scale = Vector::<F, NF>::cast_from(scale);
-
-    match scheme.mode {
-        QuantMode::Symmetric => q_values * scale,
-        // Codebook dequant needs a centroid table this affine helper doesn't
-        // carry; it lives in cubek-quant. Guard at comptime (this match is over
-        // a comptime scheme, so the arm is only reached for codebook schemes).
-        QuantMode::Codebook => panic!("codebook dequant unsupported in cubecl-std; use cubek-quant"),
+    if comptime!(matches!(scheme.mode, QuantMode::Codebook)) {
+        dequantize_codebook::<Q, S, F, NQ, NF>(value, scale, scheme, codebook)
+    } else {
+        let q_values = match scheme.store {
+            QuantStore::Native | QuantStore::PackedNative(_) => Vector::<F, NF>::cast_from(value),
+            QuantStore::PackedU32(_) => {
+                unpack_cast_u32::<F, NQ, NF>(Vector::cast_from(value), scheme)
+            }
+            // Dense packing only occurs with codebook schemes (handled above).
+            QuantStore::PackedU32Dense(_) => panic!("dense packing requires a codebook scheme"),
+        };
+        let scale = Vector::<F, NF>::cast_from(scale);
+        q_values * scale
     }
+}
+
+/// Codebook dequant: each `size_bits`-wide code is a centroid index. Codes are
+/// densely bit-packed (`PackedU32Dense`): code `j` lives at bit `j·bits` of the
+/// `NQ`-wide u32 unit and may straddle a word, so the high bits come from the
+/// next word. The whole unit shares one `scale`. Word index, bit offset and mask
+/// all fold to comptime constants; the centroid LUT is baked from the comptime
+/// `codebook`. Result is `centroid[code] · scale`.
+#[cube]
+fn dequantize_codebook<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF: Size>(
+    value: Vector<Q, NQ>,
+    scale: S,
+    #[comptime] scheme: QuantScheme,
+    #[comptime] codebook: Codebook,
+) -> Vector<F, NF> {
+    // Centroids are f32 constants (need decimal precision, so `f32::new`, not
+    // `Numeric::from_int`); cast each looked-up centroid to `F` at use.
+    let levels = comptime!(1usize << scheme.size_bits_value());
+    let mut lut = Array::<f32>::new(levels);
+    #[unroll]
+    for i in 0..levels {
+        lut[i] = f32::new(comptime!(codebook.0[i]));
+    }
+
+    let scale = Vector::<F, NF>::cast_from(scale);
+    let words = Vector::<u32, NQ>::cast_from(value);
+    let bits = comptime!(scheme.size_bits_value());
+    let mask = comptime!((1u32 << bits) - 1);
+    let num = comptime!(scheme.num_quants());
+
+    let mut out = Vector::<F, NF>::empty();
+    #[unroll]
+    for j in 0..num {
+        let word = comptime!((j * bits) / 32);
+        let bitoff = comptime!((j * bits) % 32);
+        let lo = words.extract(word) >> comptime!(bitoff as u32);
+        let raw = if comptime!(bitoff + bits > 32) {
+            (lo | (words.extract(word + 1) << comptime!((32 - bitoff) as u32))) & mask
+        } else {
+            lo & mask
+        };
+        out.insert(j, F::cast_from(lut[raw as usize]) * scale.extract(j));
+    }
+    out
 }
 
 /// Unpack a set of values from u32, and convert to the specified floating point format.
