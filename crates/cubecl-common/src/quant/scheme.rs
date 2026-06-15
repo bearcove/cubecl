@@ -1,7 +1,37 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::hash::{Hash, Hasher};
 use core::{default::Default, ops::Deref};
 use serde::{Deserialize, Serialize};
+
+/// A codebook (centroid table) for [`QuantMode::Codebook`], supplied by the
+/// caller as a **comptime constant** baked into the shader — never a runtime
+/// buffer, and the values are never hardcoded in this fork (the caller, e.g.
+/// bee, owns them and passes `Codebook(&ITS_TABLE)`).
+///
+/// `f32` is neither `Hash` nor `Eq` (NaN), so we key on the bit pattern — fine
+/// for a fixed table — which lets `Codebook` be a `#[comptime]` kernel arg.
+#[derive(Clone, Copy, Debug)]
+pub struct Codebook(pub &'static [f32]);
+
+impl PartialEq for Codebook {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+impl Eq for Codebook {}
+impl Hash for Codebook {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for v in self.0 {
+            v.to_bits().hash(state);
+        }
+    }
+}
 
 /// Describes a quantization scheme/configuration.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -76,6 +106,23 @@ impl QuantScheme {
     /// Returns the number of quantized values stored in a single element.
     pub fn num_quants(&self) -> usize {
         self.size_bits_stored() / self.value.size_bits()
+    }
+
+    /// Number of `u32` storage words holding one dense unit (one `num_quants`
+    /// group). For [`QuantStore::PackedU32`] this is always 1; for
+    /// [`QuantStore::PackedU32Dense`] it is `lcm(value_bits, 32) / 32` (e.g. 3
+    /// for 6-bit codes, where 16 codes straddle 3 words). Used to size the `NQ`
+    /// of the stored `Vector<u32, NQ>` so a single load covers a whole unit —
+    /// `num_quants / num_quants` (= 1 unit) does NOT give the word count when
+    /// codes don't divide 32 evenly.
+    pub fn storage_words_per_unit(&self) -> usize {
+        match self.store {
+            QuantStore::PackedU32(_) | QuantStore::PackedU32Dense(_) => {
+                self.size_bits_stored() / 32
+            }
+            // Non-u32 stores don't pack into u32 words; one element per quant unit.
+            QuantStore::Native | QuantStore::PackedNative(_) => 1,
+        }
     }
 
     /// Returns the native packing factor for the values. When native packing > 1, the packed

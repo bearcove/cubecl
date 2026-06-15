@@ -9,7 +9,7 @@ use crate::tensor::{
 use cubecl::prelude::*;
 use cubecl_common::{
     e2m1x2, e4m3, e5m2,
-    quant::scheme::{QuantParam, QuantScheme, QuantStore, QuantValue},
+    quant::scheme::{Codebook, QuantParam, QuantScheme, QuantStore, QuantValue},
     ue8m0,
 };
 use cubecl_core::{
@@ -43,6 +43,8 @@ pub struct QuantizedView<
     #[cube(comptime)]
     scheme: QuantScheme,
     #[cube(comptime)]
+    codebook: Codebook,
+    #[cube(comptime)]
     _ty: PhantomData<(F, NF)>,
 }
 
@@ -54,11 +56,13 @@ impl<'a, Q: Scalar, NQ: Size, S: Scalar, F: Numeric, NF: Size, C: Coordinates + 
         values: View<'a, Vector<Q, NQ>, C>,
         scales: View<'a, S, C>,
         #[comptime] scheme: QuantScheme,
+        #[comptime] codebook: Codebook,
     ) -> Self {
         QuantizedView::<'a, Q, NQ, S, F, NF, C> {
             values,
             scales,
             scheme,
+            codebook,
             _ty: PhantomData,
         }
     }
@@ -86,11 +90,13 @@ impl<'a, Q: Scalar, NQ: Size, S: Scalar, F: Numeric, NF: Size, C: Coordinates + 
         values: ViewExpand<'a, Vector<Q, NQ>, C>,
         scales: ViewExpand<'a, S, C>,
         scheme: QuantScheme,
+        codebook: Codebook,
     ) -> Self {
         QuantizedViewExpand::<'a, Q, NQ, S, F, NF, C> {
             values,
             scales,
             scheme,
+            codebook,
             _ty: PhantomData,
         }
     }
@@ -128,7 +134,13 @@ impl<'a, Q: Scalar, NQ: Size, S: Scalar, F: Numeric, NF: Size, C: Coordinates + 
         let value = self.values.clone().__expand_read_method(scope, pos.clone());
         let scale = self.scales.clone().__expand_read_method(scope, pos);
 
-        dequantize_aligned::expand::<Q, S, F, NQ, NF>(scope, value, scale, self.scheme)
+        dequantize_aligned::expand::<Q, S, F, NQ, NF>(
+            scope,
+            value,
+            scale,
+            self.scheme,
+            self.codebook,
+        )
     }
 
     fn __expand_read_checked_method(
@@ -145,7 +157,13 @@ impl<'a, Q: Scalar, NQ: Size, S: Scalar, F: Numeric, NF: Size, C: Coordinates + 
             .clone()
             .__expand_read_checked_method(scope, pos.clone());
 
-        dequantize_aligned::expand::<Q, S, F, NQ, NF>(scope, value, scale, self.scheme)
+        dequantize_aligned::expand::<Q, S, F, NQ, NF>(
+            scope,
+            value,
+            scale,
+            self.scheme,
+            self.codebook,
+        )
     }
 
     fn __expand_read_masked_method(
@@ -164,7 +182,13 @@ impl<'a, Q: Scalar, NQ: Size, S: Scalar, F: Numeric, NF: Size, C: Coordinates + 
             .__expand_read_checked_method(scope, pos.clone());
         let in_bounds = self.__expand_is_in_bounds_method(scope, pos);
 
-        let value = dequantize_aligned::expand::<Q, S, F, NQ, NF>(scope, value, scale, self.scheme);
+        let value = dequantize_aligned::expand::<Q, S, F, NQ, NF>(
+            scope,
+            value,
+            scale,
+            self.scheme,
+            self.codebook,
+        );
         select::expand::<Vector<F, NF>>(scope, in_bounds, value, mask_value)
     }
 
@@ -182,7 +206,13 @@ impl<'a, Q: Scalar, NQ: Size, S: Scalar, F: Numeric, NF: Size, C: Coordinates + 
             .clone()
             .__expand_read_unchecked_method(scope, pos);
 
-        dequantize_aligned::expand::<Q, S, F, NQ, NF>(scope, value, scale, self.scheme)
+        dequantize_aligned::expand::<Q, S, F, NQ, NF>(
+            scope,
+            value,
+            scale,
+            self.scheme,
+            self.codebook,
+        )
     }
 
     fn __expand_as_linear_slice_method(
@@ -221,6 +251,7 @@ struct ExpandDynamic<'a, E: Numeric, N: Size, C: Coordinates + 'static> {
     values: &'a ViewCompilationArg<C>,
     scales: &'a ViewCompilationArg<C>,
     scheme: QuantScheme,
+    codebook: Codebook,
     builder: &'a mut KernelBuilder,
     _ty: PhantomData<(E, N)>,
 }
@@ -234,12 +265,16 @@ impl<'a, E: Numeric, N: Size, C: Coordinates + 'static> RunWithQuantType
         define_size!(NQ);
 
         let vector_size = N::__expand_value(&self.builder.scope);
-        let vector_size_q = vector_size / self.scheme.num_quants();
+        // `NF / num_quants` is the number of dense units in the load; each unit
+        // occupies `storage_words_per_unit` u32 words (3 for 6-bit dense, where
+        // the naive `NF / num_quants` would give 1 and read out of bounds).
+        let vector_size_q = (vector_size / self.scheme.num_quants())
+            * self.scheme.storage_words_per_unit();
         self.builder.scope.register_size::<NQ>(vector_size_q);
 
         let values = View::<Vector<Q, NQ>, C>::expand(self.values, self.builder);
         let scales = View::<S, C>::expand(self.scales, self.builder);
-        let view = QuantizedViewExpand::new(values, scales, self.scheme);
+        let view = QuantizedViewExpand::new(values, scales, self.scheme, self.codebook);
         ViewExpand::new(&self.builder.scope, view)
     }
 }
@@ -248,6 +283,7 @@ pub(crate) struct RegisterDynamic<'a, E: CubePrimitive, C: Coordinates + 'static
     pub values: ViewArg<C, R>,
     pub scales: ViewArg<C, R>,
     pub scheme: QuantScheme,
+    pub codebook: Codebook,
     pub launcher: &'a mut KernelLauncher<R>,
     pub _ty: PhantomData<E>,
 }
@@ -261,7 +297,10 @@ impl<'a, E: CubePrimitive, C: Coordinates + 'static, R: Runtime> RunWithQuantTyp
         define_size!(NQ);
 
         self.launcher.with_scope(|scope| {
-            let vector_size_q = E::__expand_vector_size(scope) / self.scheme.num_quants();
+            // See `ExpandDynamic::execute`: units-in-load × u32-words-per-unit,
+            // so 6-bit dense gets NQ=3 (not the naive `NF / num_quants` = 1).
+            let vector_size_q = (E::__expand_vector_size(scope) / self.scheme.num_quants())
+                * self.scheme.storage_words_per_unit();
             scope.register_size::<NQ>(vector_size_q);
         });
 
@@ -271,6 +310,7 @@ impl<'a, E: CubePrimitive, C: Coordinates + 'static, R: Runtime> RunWithQuantTyp
             values: Box::new(values),
             scales: Box::new(scales),
             scheme: self.scheme,
+            codebook: self.codebook,
         }
     }
 }
@@ -315,6 +355,7 @@ pub(crate) fn expand_dynamic<E: CubePrimitive, C: Coordinates + 'static>(
     values: &ViewCompilationArg<C>,
     scales: &ViewCompilationArg<C>,
     scheme: QuantScheme,
+    codebook: Codebook,
     builder: &mut KernelBuilder,
 ) -> ViewExpand<'static, E, C> {
     use core::mem::transmute as t;
@@ -324,12 +365,14 @@ pub(crate) fn expand_dynamic<E: CubePrimitive, C: Coordinates + 'static>(
         values: &ViewCompilationArg<C>,
         scales: &ViewCompilationArg<C>,
         scheme: QuantScheme,
+        codebook: Codebook,
         builder: &mut KernelBuilder,
     ) -> ViewExpand<'static, Vector<F, NF>, C> {
         let func = ExpandDynamic {
             values,
             scales,
             scheme,
+            codebook,
             builder,
             _ty: PhantomData::<(F, NF)>,
         };
@@ -347,22 +390,22 @@ pub(crate) fn expand_dynamic<E: CubePrimitive, C: Coordinates + 'static>(
         match E::__expand_as_type(&builder.scope).storage_type() {
             StorageType::Scalar(ElemType::Float(ty)) => match ty {
                 FloatKind::F16 => t(expand_dynamic_f::<f16, NF, C>(
-                    values, scales, scheme, builder,
+                    values, scales, scheme, codebook, builder,
                 )),
                 FloatKind::BF16 => t(expand_dynamic_f::<bf16, NF, C>(
-                    values, scales, scheme, builder,
+                    values, scales, scheme, codebook, builder,
                 )),
                 FloatKind::Flex32 => t(expand_dynamic_f::<flex32, NF, C>(
-                    values, scales, scheme, builder,
+                    values, scales, scheme, codebook, builder,
                 )),
                 FloatKind::F32 => t(expand_dynamic_f::<f32, NF, C>(
-                    values, scales, scheme, builder,
+                    values, scales, scheme, codebook, builder,
                 )),
                 FloatKind::TF32 => t(expand_dynamic_f::<tf32, NF, C>(
-                    values, scales, scheme, builder,
+                    values, scales, scheme, codebook, builder,
                 )),
                 FloatKind::F64 => t(expand_dynamic_f::<f64, NF, C>(
-                    values, scales, scheme, builder,
+                    values, scales, scheme, codebook, builder,
                 )),
                 FloatKind::E2M1
                 | FloatKind::E2M3

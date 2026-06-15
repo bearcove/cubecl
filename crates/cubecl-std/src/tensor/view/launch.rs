@@ -391,7 +391,7 @@ mod layout {
 pub use layout::*;
 
 mod dynamic {
-    use cubecl_common::quant::scheme::QuantScheme;
+    use cubecl_common::quant::scheme::{Codebook, QuantScheme};
 
     use crate::{
         quant::{
@@ -429,6 +429,7 @@ mod dynamic {
             values: Box<ViewArg<C, R>>,
             scales: Box<ViewArg<C, R>>,
             scheme: QuantScheme,
+            codebook: Codebook,
         },
     }
 
@@ -477,11 +478,19 @@ mod dynamic {
 
         /// Create a new view arg that dequantizes on read.
         /// The scales layout should take values indices and map them to the corresponding scale.
-        pub fn new_quantized(values: Self, scales: Self, scheme: QuantScheme) -> Self {
+        /// `codebook` is the comptime centroid table for [`QuantMode::Codebook`]
+        /// schemes; pass `Codebook(&[])` for symmetric schemes.
+        pub fn new_quantized(
+            values: Self,
+            scales: Self,
+            scheme: QuantScheme,
+            codebook: Codebook,
+        ) -> Self {
             Self::Quantized {
                 values: Box::new(values),
                 scales: Box::new(scales),
                 scheme,
+                codebook,
             }
         }
     }
@@ -503,6 +512,7 @@ mod dynamic {
             values: Box<ViewCompilationArg<C>>,
             scales: Box<ViewCompilationArg<C>>,
             scheme: QuantScheme,
+            codebook: Codebook,
         },
     }
 
@@ -536,13 +546,20 @@ mod dynamic {
                         values,
                         scales,
                         scheme,
+                        codebook,
                     },
                     ViewCompilationArg::Quantized {
                         values: values_other,
                         scales: scales_other,
                         scheme: scheme_other,
+                        codebook: codebook_other,
                     },
-                ) => values == values_other && scales == scales_other && scheme == scheme_other,
+                ) => {
+                    values == values_other
+                        && scales == scales_other
+                        && scheme == scheme_other
+                        && codebook == codebook_other
+                }
                 _ => false,
             }
         }
@@ -566,10 +583,12 @@ mod dynamic {
                     values,
                     scales,
                     scheme,
+                    codebook,
                 } => {
                     values.hash(ra_expand_state);
                     scales.hash(ra_expand_state);
                     scheme.hash(ra_expand_state);
+                    codebook.hash(ra_expand_state);
                 }
             }
         }
@@ -596,11 +615,13 @@ mod dynamic {
                     values,
                     scales,
                     scheme,
+                    codebook,
                 } => f
                     .debug_struct("QuantizedView")
                     .field("values", &values)
                     .field("scales", &scales)
                     .field("scheme", &scheme)
+                    .field("codebook", &codebook)
                     .finish(),
             }
         }
@@ -636,11 +657,13 @@ mod dynamic {
                     values,
                     scales,
                     scheme,
+                    codebook,
                 } => {
                     let register = RegisterDynamic {
                         values: *values,
                         scales: *scales,
                         scheme,
+                        codebook,
                         launcher,
                         _ty: PhantomData::<E>,
                     };
@@ -685,7 +708,8 @@ mod dynamic {
                     values,
                     scales,
                     scheme,
-                } => quant::view::expand_dynamic(values, scales, *scheme, builder),
+                    codebook,
+                } => quant::view::expand_dynamic(values, scales, *scheme, *codebook, builder),
             }
         }
     }

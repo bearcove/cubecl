@@ -1,7 +1,7 @@
 use cubecl::prelude::*;
 use cubecl_common::{
     e2m1, e2m1x2,
-    quant::scheme::{QuantScheme, QuantValue},
+    quant::scheme::{Codebook, QuantScheme, QuantValue},
 };
 use cubecl_core::{self as cubecl};
 
@@ -75,7 +75,7 @@ pub fn test_quantized_per_tensor_int<R: Runtime, F: Float + CubeElement>(
         unsafe { BufferArg::from_raw_parts(scales, 1) },
         scales_layout,
     );
-    let quantized_view = ViewArg::new_quantized(values_view, scales_view, scheme);
+    let quantized_view = ViewArg::new_quantized(values_view, scales_view, scheme, Codebook(&[]));
     let float_view = ViewArg::new_array::<PlainLayout>(
         unsafe { BufferArg::from_raw_parts(float_values, 16) },
         (),
@@ -141,7 +141,7 @@ pub fn test_quantized_per_tensor_fp4<R: Runtime, F: Float + CubeElement>(
         unsafe { BufferArg::from_raw_parts(scales, 1) },
         scales_layout,
     );
-    let quantized_view = ViewArg::new_quantized(values_view, scales_view, scheme);
+    let quantized_view = ViewArg::new_quantized(values_view, scales_view, scheme, Codebook(&[]));
     let float_view = ViewArg::new_array::<PlainLayout>(
         unsafe { BufferArg::from_raw_parts(float_values, 16) },
         (),
