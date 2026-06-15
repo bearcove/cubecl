@@ -14,6 +14,9 @@ pub fn dequantize_aligned<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF:
     let q_values = match scheme.store {
         QuantStore::Native | QuantStore::PackedNative(_) => Vector::<F, NF>::cast_from(value),
         QuantStore::PackedU32(_) => unpack_cast_u32::<F, NQ, NF>(Vector::cast_from(value), scheme),
+        // Dense bit-packing is handled by cubek-quant's codebook path, not this
+        // affine helper (comptime-guarded: only reached for dense schemes).
+        QuantStore::PackedU32Dense(_) => panic!("dense packing unsupported in cubecl-std"),
     };
     let scale = Vector::<F, NF>::cast_from(scale);
 
@@ -87,6 +90,7 @@ fn cast_masked<F: Numeric, N: Size>(value: u32, #[comptime] scheme: QuantScheme)
         QuantValue::E4M3 => Vector::<F, N>::cast_from(e4m3::from_bits(value as u8)),
         QuantValue::E2M1 => Vector::<F, N>::cast_from(e2m1x2::from_bits(value as u8)),
         QuantValue::Q8F
+        | QuantValue::Q6F
         | QuantValue::Q4F
         | QuantValue::Q2F
         | QuantValue::Q8S
