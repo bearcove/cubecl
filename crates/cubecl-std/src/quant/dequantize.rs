@@ -19,6 +19,10 @@ pub fn dequantize_aligned<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF:
 
     match scheme.mode {
         QuantMode::Symmetric => q_values * scale,
+        // Codebook dequant needs a centroid table this affine helper doesn't
+        // carry; it lives in cubek-quant. Guard at comptime (this match is over
+        // a comptime scheme, so the arm is only reached for codebook schemes).
+        QuantMode::Codebook => panic!("codebook dequant unsupported in cubecl-std; use cubek-quant"),
     }
 }
 
