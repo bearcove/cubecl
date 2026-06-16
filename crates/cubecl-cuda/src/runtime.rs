@@ -92,16 +92,34 @@ impl DeviceService for CudaServer {
             ctx
         };
 
-        // CHECKED total-device-memory query. The previous code called the raw
-        // `cuDeviceTotalMem_v2` binding and IGNORED its CUresult, then did
-        // `MaybeUninit::assume_init()` — so any failure (e.g. driver/ABI drift)
-        // left `bytes` uninitialized (UB) → garbage `max_memory` → a too-small
-        // `max_page_size` that rejects legitimate large buffers
-        // ("can't allocate buffer of size: …"). Use cudarc's checked wrapper.
+        // ROBUST total-device-memory query. `cuDeviceTotalMem_v2` can return
+        // CUDA_SUCCESS yet NOT write its out-param under cudarc↔driver ABI drift
+        // (observed: cudarc 0.19.x against a CUDA 13.x driver) — so even the
+        // *checked* wrapper leaves `MaybeUninit::assume_init()` reading
+        // uninitialized stack → garbage `max_memory` → a tiny `max_page_size`
+        // that rejects legitimate buffers ("can't allocate buffer of size: …").
+        // The garbage value depends on prior stack state (e.g. whether an autotune
+        // cache was loaded) → intermittent. Defense: cross-check two independent
+        // queries, keep only sane (≥1 GiB) results, take the largest, and floor to
+        // 8 GiB so `max_page` is never absurdly small.
         // SAFETY: `device_ptr` is a valid device handle from `device::get`.
-        let max_memory =
-            unsafe { cudarc::driver::result::device::total_mem(device_ptr) }
-                .expect("cuDeviceTotalMem failed") as u64;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let by_total =
+            unsafe { cudarc::driver::result::device::total_mem(device_ptr) }.ok().map(|b| b as u64);
+        let by_info =
+            cudarc::driver::result::mem_get_info().ok().map(|(_free, total)| total as u64);
+        let max_memory = [by_total, by_info]
+            .iter()
+            .filter_map(|o| *o)
+            .filter(|&b| b >= GIB)
+            .max()
+            .unwrap_or(8 * GIB);
+        if std::env::var("CUBECL_MEM_DEBUG").is_ok() {
+            eprintln!(
+                "[cubecl-cuda] total_mem={by_total:?} mem_get_info_total={by_info:?} -> max_memory={max_memory} max_page={}",
+                max_memory / 4
+            );
+        }
         let mem_properties = MemoryDeviceProperties {
             max_page_size: max_memory / 4,
             alignment: mem_alignment as u64,
