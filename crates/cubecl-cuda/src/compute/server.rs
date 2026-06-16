@@ -121,8 +121,17 @@ impl ComputeServer for CudaServer {
             Err(err) => unreachable!("{err}"),
         };
 
-        let reserved = command.reserve(size).unwrap();
-        command.bind(reserved, memory);
+        // A reservation can legitimately fail at runtime (OOM, or the memory pool
+        // rejecting an allocation) — notably while autotune probes candidate
+        // kernels. Record the failure on the stream instead of `.unwrap()`-
+        // panicking the dispatch thread: a recorded error makes `is_healthy`
+        // false, so the next health-enforcing command returns `Err` and the
+        // autotuner skips this candidate (errors are drained between candidates),
+        // rather than the whole process cascading down a now-dead channel.
+        match command.reserve(size) {
+            Ok(reserved) => command.bind(reserved, memory),
+            Err(err) => command.error(err.into()),
+        }
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {

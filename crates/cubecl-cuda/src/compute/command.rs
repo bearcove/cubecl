@@ -117,11 +117,16 @@ impl<'a> Command<'a> {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     pub fn bind(&mut self, reserved: ManagedMemoryHandle, new: ManagedMemoryHandle) {
         let cursor = self.cursor();
-        self.streams
+        if let Err(err) = self
+            .streams
             .current()
             .memory_management_gpu
             .bind(reserved, new, cursor)
-            .unwrap();
+        {
+            // Record on the stream instead of `.unwrap()`-panicking the dispatch
+            // thread (see `initialize_memory`); the health gate rejects later ops.
+            self.error(err.into());
+        }
     }
 
     /// Creates a [Bytes] instance from pinned memory, if suitable for the given size.
