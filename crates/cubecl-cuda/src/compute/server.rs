@@ -130,7 +130,20 @@ impl ComputeServer for CudaServer {
         // rather than the whole process cascading down a now-dead channel.
         match command.reserve(size) {
             Ok(reserved) => command.bind(reserved, memory),
-            Err(err) => command.error(err.into()),
+            Err(err) => {
+                // Dump the live memory picture at the failure so we can tell real
+                // pressure from a spurious pool reject, and spot a leak across
+                // repeated failed attempts (in_use/reserved should NOT climb).
+                if std::env::var("CUBECL_MEM_DEBUG").is_ok() {
+                    let u = command.memory_usage();
+                    let free = cudarc::driver::result::mem_get_info().ok().map(|(f, t)| (f, t));
+                    eprintln!(
+                        "[cubecl-cuda] reserve({size}) FAILED ({err}); pool in_use={} reserved={} allocs={}; gpu (free,total)={:?}",
+                        u.bytes_in_use, u.bytes_reserved, u.number_allocs, free
+                    );
+                }
+                command.error(err.into())
+            }
         }
     }
 
@@ -710,20 +723,22 @@ impl CudaServer {
             (None, handle)
         };
 
+        // A binding's resource can be missing if its backing reservation failed
+        // upstream (e.g. while autotune probes candidates) — propagate as `Err`
+        // (the `launch` caller records it on the stream and the candidate is
+        // skipped) instead of `.expect()`-panicking the dispatch thread.
         let mut resources = bindings
             .tensor_maps
             .iter()
             .map(|it| it.binding.clone())
             .chain(bindings.buffers)
-            .map(|binding| command.resource(binding).expect("Resource to exist."))
-            .collect::<Vec<_>>();
+            .map(|binding| command.resource(binding))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut tensor_maps = Vec::with_capacity(bindings.tensor_maps.len());
 
         for TensorMapBinding { map, binding } in bindings.tensor_maps.into_iter() {
-            let resource = command
-                .resource(binding)
-                .expect("Tensor map resource exists.");
+            let resource = command.resource(binding)?;
             let device_ptr = resource.ptr as *mut c_void;
 
             let mut map_ptr = MaybeUninit::zeroed();
