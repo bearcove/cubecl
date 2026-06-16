@@ -31,8 +31,8 @@ use cubecl_cpp::{
 use cubecl_runtime::{
     allocator::PitchedMemoryLayoutPolicy, client::ComputeClient, logging::ServerLogger,
 };
-use cudarc::driver::sys::{CUDA_VERSION, cuDeviceTotalMem_v2};
-use std::{mem::MaybeUninit, sync::Arc};
+use cudarc::driver::sys::CUDA_VERSION;
+use std::sync::Arc;
 
 /// Options configuring the CUDA runtime.
 #[derive(Default)]
@@ -92,13 +92,16 @@ impl DeviceService for CudaServer {
             ctx
         };
 
-        // SAFETY: `device_ptr` is valid. `cuDeviceTotalMem_v2` writes the total device memory
-        // into the `MaybeUninit`, making `assume_init()` valid on success.
-        let max_memory = unsafe {
-            let mut bytes = MaybeUninit::uninit();
-            cuDeviceTotalMem_v2(bytes.as_mut_ptr(), device_ptr);
-            bytes.assume_init() as u64
-        };
+        // CHECKED total-device-memory query. The previous code called the raw
+        // `cuDeviceTotalMem_v2` binding and IGNORED its CUresult, then did
+        // `MaybeUninit::assume_init()` — so any failure (e.g. driver/ABI drift)
+        // left `bytes` uninitialized (UB) → garbage `max_memory` → a too-small
+        // `max_page_size` that rejects legitimate large buffers
+        // ("can't allocate buffer of size: …"). Use cudarc's checked wrapper.
+        // SAFETY: `device_ptr` is a valid device handle from `device::get`.
+        let max_memory =
+            unsafe { cudarc::driver::result::device::total_mem(device_ptr) }
+                .expect("cuDeviceTotalMem failed") as u64;
         let mem_properties = MemoryDeviceProperties {
             max_page_size: max_memory / 4,
             alignment: mem_alignment as u64,
