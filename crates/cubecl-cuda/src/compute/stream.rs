@@ -148,10 +148,17 @@ impl EventStreamBackend for CudaStreamBackend {
     }
 
     fn handle_cursor(stream: &Self::Stream, binding: &Binding) -> u64 {
+        // Called (via `update_shared_bindings`) for cross-stream sync analysis
+        // BEFORE the stream's health gate. A handle whose backing reservation
+        // failed (see `initialize_memory`) has no page, so `get_cursor` errors —
+        // return a sentinel `0` instead of `.unwrap()`-panicking the dispatch
+        // thread. The subsequent `enforce_healthy` check then rejects the command
+        // and the autotuner skips the candidate; the cursor only orders sync for a
+        // binding that is about to be discarded.
         stream
             .memory_management_gpu
             .get_cursor(binding.memory.clone())
-            .unwrap()
+            .unwrap_or(0)
     }
 
     fn is_healthy(stream: &Self::Stream) -> bool {
