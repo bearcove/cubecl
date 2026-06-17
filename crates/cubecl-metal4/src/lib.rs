@@ -15,8 +15,12 @@
 mod device;
 #[cfg(target_os = "macos")]
 mod imp;
+#[cfg(target_os = "macos")]
+mod storage;
 
 #[cfg(target_os = "macos")]
 pub use device::*;
 #[cfg(target_os = "macos")]
 pub use imp::*;
+#[cfg(target_os = "macos")]
+pub use storage::*;
