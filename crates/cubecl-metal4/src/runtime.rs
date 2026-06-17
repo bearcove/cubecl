@@ -9,7 +9,7 @@ use cubecl_core::{
     device::{DeviceId, ServerUtilitiesHandle},
     ir::{
         DeviceProperties, ElemType, FloatKind, HardwareProperties, MemoryDeviceProperties,
-        TargetProperties, VectorSize, features::Plane,
+        TargetProperties, features::Plane,
     },
     server::ServerUtilities,
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
