@@ -11,24 +11,24 @@
 //! Everything is Apple-only; on other targets the crate is intentionally empty
 //! so the cubecl workspace (`members = ["crates/*"]`) still builds on Linux/CUDA.
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod device;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod imp;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod runtime;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod server;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod storage;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use device::*;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use imp::*;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use runtime::*;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use server::*;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use storage::*;
