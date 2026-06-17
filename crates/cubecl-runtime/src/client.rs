@@ -520,6 +520,24 @@ impl<R: Runtime> ComputeClient<R> {
         self.do_empty(vec![descriptor]).unwrap().remove(0).memory
     }
 
+    /// Bind **external, caller-owned** memory (`ptr`, `len` bytes) as a ZERO-COPY
+    /// buffer and return a handle over it — no allocation and no `memcpy`, unlike
+    /// [`create`](Self::create). For mmap'd, page-aligned weights. Only backends
+    /// with foreign-buffer support (Metal 4) implement [`ComputeServer::create_external`].
+    ///
+    /// # Safety
+    /// `ptr` must be page-aligned and valid for `len` bytes, and the caller MUST keep
+    /// the backing mapping alive for at least as long as the returned handle (and any
+    /// GPU work that binds it).
+    pub unsafe fn create_external(&self, ptr: u64, len: usize) -> Handle {
+        let stream_id = self.stream_id();
+        let memory = self
+            .device
+            .submit_blocking(move |server| unsafe { server.create_external(ptr, len, stream_id) })
+            .expect("create_external task failed");
+        Handle::from_memory(memory, stream_id, len as u64)
+    }
+
     /// Reserves `shape` in the storage, and returns a tensor handle for it.
     /// See [`ComputeClient::create_tensor`]
     pub fn empty_tensor(&self, shape: Shape, elem_size: usize) -> MemoryLayout {

@@ -79,6 +79,20 @@ impl Metal4Storage {
             self.memory.remove(&id);
         }
     }
+
+    /// Register **external, caller-owned** memory as a no-copy buffer and return a
+    /// [`StorageHandle`] over it (zero-copy weight load; see [`Metal4::alloc_no_copy`]).
+    ///
+    /// # Safety
+    /// `ptr` must be page-aligned, valid for `len` bytes, and outlive this storage
+    /// entry (the caller keeps the backing `Mmap` alive). Dropping the entry frees
+    /// only the `MTLBuffer` wrapper, never `ptr`.
+    pub unsafe fn register_external(&mut self, ptr: *mut u8, len: usize) -> StorageHandle {
+        let id = StorageId::new();
+        let buffer = unsafe { self.ctx.alloc_no_copy(ptr, len) };
+        self.memory.insert(id, buffer);
+        StorageHandle::new(id, StorageUtilization { offset: 0, size: len as u64 })
+    }
 }
 
 impl core::fmt::Debug for Metal4Storage {

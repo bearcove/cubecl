@@ -123,7 +123,18 @@ pub struct MemoryManagement<Storage> {
     mode: MemoryAllocationMode,
     config: PersistentMemory,
     logger: Arc<ServerLogger>,
+    /// Foreign, caller-owned buffers (e.g. mmap'd weights bound zero-copy via
+    /// `newBufferWithBytesNoCopy`). They live OUTSIDE the pools: never sliced,
+    /// never recycled (a reused external slice would write into read-only mapped
+    /// memory), reclaimed only when the last handle drops. Addressed by the
+    /// [`EXTERNAL_POOL`] sentinel in [`MemoryLocation::pool`].
+    external_slices: Vec<Slice>,
 }
+
+/// Sentinel `MemoryLocation::pool` marking a [`Slice`] held in
+/// [`MemoryManagement::external_slices`] rather than any pool. Distinct from the
+/// persistent pool (whose index is `pools.len()`, always far below `u8::MAX`).
+const EXTERNAL_POOL: u8 = u8::MAX;
 
 fn generate_bucket_sizes(
     start_size: u64,
@@ -353,7 +364,30 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
             mode,
             config,
             logger,
+            external_slices: Vec::new(),
         }
+    }
+
+    /// Register a **foreign, caller-owned** buffer (already created in `storage`,
+    /// e.g. via `newBufferWithBytesNoCopy` over an mmap) and return a handle to it.
+    /// The buffer lives outside the pools: never sliced, never recycled, and only
+    /// its `MTLBuffer` wrapper is reclaimed (in [`cleanup`]) once every handle drops
+    /// — the caller still owns the backing memory and MUST keep it alive meanwhile.
+    pub fn reserve_external(&mut self, storage: StorageHandle) -> ManagedMemoryHandle {
+        let slice = Slice::new(storage, 0);
+        let pos = self.external_slices.len();
+        slice
+            .descriptor()
+            .update_location(MemoryLocation::new(EXTERNAL_POOL, 0, pos as u32));
+        let handle = slice.handle.clone();
+        self.external_slices.push(slice);
+        handle
+    }
+
+    /// Mutable access to the underlying storage, so a concrete backend can register
+    /// foreign buffers before [`reserve_external`].
+    pub fn storage_mut(&mut self) -> &mut Storage {
+        &mut self.storage
     }
 
     /// Change the mode of allocation.
@@ -389,6 +423,24 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
         for pool in self.pools.iter_mut() {
             pool.cleanup(&mut self.storage, self.alloc_reserve_count, explicit);
         }
+
+        // Reclaim foreign buffers whose last handle has dropped (frees only the
+        // `MTLBuffer` wrapper; the caller owns/frees the backing memory). Survivors
+        // are re-indexed since `location.slice` is their position. Explicit-only to
+        // avoid re-indexing on every periodic cleanup.
+        if explicit && !self.external_slices.is_empty() {
+            let slices = core::mem::take(&mut self.external_slices);
+            let mut kept = Vec::with_capacity(slices.len());
+            for slice in slices {
+                if slice.is_free() {
+                    self.storage.dealloc(slice.storage.id);
+                } else {
+                    slice.descriptor().update_slice(kept.len() as u32);
+                    kept.push(slice);
+                }
+            }
+            self.external_slices = kept;
+        }
     }
 
     /// Returns the storage from the specified binding
@@ -400,6 +452,14 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// Returns the storage from the specified binding
     fn find(&self, binding: ManagedMemoryBinding) -> Result<&Slice, IoError> {
         let id = binding.descriptor();
+
+        if id.location().pool == EXTERNAL_POOL {
+            let slice = id.location().slice as usize;
+            return self.external_slices.get(slice).ok_or_else(|| IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: format!("External slice {slice} doesn't exist").into(),
+            });
+        }
 
         if id.location().pool >= self.pools.len() as u8 {
             return self.persistent.find(&binding);
