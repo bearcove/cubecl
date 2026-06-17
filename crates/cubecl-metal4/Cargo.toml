@@ -1,0 +1,43 @@
+[package]
+name = "cubecl-metal4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Metal 4 runtime for CubeCL (no wgpu): MTL4 command queue, MTLBuffer storage, MSL pipelines, and per-dispatch GPU timestamps."
+repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-metal4"
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+# Everything here is Apple/Metal-only. On other targets the crate is an empty
+# lib so the workspace (`members = ["crates/*"]`) still builds on Linux/CUDA boxes.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = { version = "0.3.2", features = [
+  "MTLAllocation",
+  "MTLBuffer",
+  "MTLCommandBuffer",
+  "MTLComputePipeline",
+  "MTLDevice",
+  "MTLEvent",
+  "MTLGPUAddress",
+  "MTLLibrary",
+  "MTLResidencySet",
+  "MTLResource",
+  "MTL4ArgumentTable",
+  "MTL4CommandAllocator",
+  "MTL4CommandBuffer",
+  "MTL4CommandEncoder",
+  "MTL4CommandQueue",
+  "MTL4CommitFeedback",
+  "MTL4ComputeCommandEncoder",
+  "block2",
+  "dispatch2",
+] }
+block2 = "0.6"
