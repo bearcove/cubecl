@@ -254,9 +254,15 @@ impl<D: Dialect> CppCompiler<D> {
             .map(|binding| (self.compile_storage_type(binding.ty), binding.count))
             .collect::<Vec<_>>();
 
-        let shared_memories = shared_allocs
-            .allocations
-            .values()
+        // Sort allocations by id before building the emission Vec: `allocations` is a
+        // HashMap, whose `values()` order is randomized per process. Emitting the shared
+        // memory declarations in that order makes byte-identical kernels differ
+        // run-to-run (same offsets, different declaration order) -> different source
+        // hash, defeating the source-hash kernel cache / AOT capture.
+        let mut sorted_allocs: Vec<_> = shared_allocs.allocations.values().collect();
+        sorted_allocs.sort_unstable_by_key(|alloc| alloc.id);
+        let shared_memories = sorted_allocs
+            .into_iter()
             .map(|alloc| SharedMemory {
                 ptr: self.compile_value(ir::Value::new(alloc.id, alloc.smem.root_ptr.ty)),
                 value_ty: self.compile_type(alloc.smem.value_ty),
