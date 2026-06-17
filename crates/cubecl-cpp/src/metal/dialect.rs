@@ -224,7 +224,14 @@ impl DialectTypes<Self> for MslDialect {
         info: &cubecl_core::Info,
         flags: &Flags<Self>,
     ) -> std::fmt::Result {
-        for item in items.iter() {
+        // Sort by emitted name before declaring the vector structs: `items` is a
+        // HashSet, whose iteration order is randomized per process, so the struct
+        // declarations (`float_4`, `bool_4`, …) come out in a different order every
+        // run -> byte-different MSL -> different source hash, defeating the
+        // source-hash kernel cache / AOT capture.
+        let mut sorted_items: Vec<&Item<Self>> = items.iter().collect();
+        sorted_items.sort_unstable_by_key(|it| format!("{it}"));
+        for item in sorted_items {
             if let Item::Vector(inner, vectorization) = item {
                 let alignment = item.size();
                 if *vectorization > 1 {
