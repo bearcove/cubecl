@@ -12,6 +12,11 @@
 //! so the cubecl workspace (`members = ["crates/*"]`) still builds on Linux/CUDA.
 
 #[cfg(target_os = "macos")]
+mod device;
+#[cfg(target_os = "macos")]
 mod imp;
+
+#[cfg(target_os = "macos")]
+pub use device::*;
 #[cfg(target_os = "macos")]
 pub use imp::*;
