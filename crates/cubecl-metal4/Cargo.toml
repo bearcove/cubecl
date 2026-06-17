@@ -60,6 +60,17 @@ objc2-metal = { version = "0.3.2", features = [
 block2 = "0.6"
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
-cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.1" }
+# `export_tests` exposes cubecl's golden-vector kernel suite (reduce, softmax,
+# matmul, normalization, …) so `testgen_all!` runs it against Metal4 — this is
+# how we bisect which op diverges/NaNs vs the wgpu/cuda oracle.
+cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.1", features = [
+    "export_tests",
+] }
+cubecl-std = { path = "../cubecl-std", version = "=0.11.0-pre.1", features = [
+    "export_tests",
+] }
 bytemuck = { workspace = true }
 half = { workspace = true }
+paste = { workspace = true }
+pretty_assertions = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }

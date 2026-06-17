@@ -32,3 +32,19 @@ pub use runtime::*;
 pub use server::*;
 #[cfg(target_vendor = "apple")]
 pub use storage::*;
+
+// Golden-vector kernel suite from cubecl-core/std, run against the native Metal 4
+// runtime. Same wiring as cubecl-cuda/cubecl-wgpu — `testgen_all!` brings reduce,
+// softmax, matmul, normalization, etc. to bear so a divergence/NaN is localized to
+// a single op (the audio-encoder NaN bisect).
+#[cfg(all(test, target_vendor = "apple"))]
+#[allow(unexpected_cfgs)]
+mod tests {
+    pub type TestRuntime = crate::Metal4Runtime;
+
+    pub use half::{bf16, f16};
+
+    cubecl_core::testgen_all!(f32: [f16, f32], i32: [i16, i32], u32: [u16, u32]);
+    cubecl_std::testgen!();
+    cubecl_std::testgen_tensor_identity!([f16, f32, u32]);
+}
