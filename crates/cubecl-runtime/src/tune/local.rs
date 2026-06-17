@@ -146,10 +146,7 @@ where
         if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
             #[cfg(feature = "autotune-checks")]
             self.checks::<I, Out>(&operations, &inputs);
-            return operations
-                .fastest(fastest_index)
-                .execute(inputs)
-                .expect("Should run when selected by autotune.");
+            return execute_with_fallback(&operations, fastest_index, inputs);
         }
 
         let fastest = tuner.check_tune::<R, I, Out>(
@@ -166,10 +163,7 @@ where
                 #[cfg(feature = "autotune-checks")]
                 self.checks::<I, Out>(&operations, &inputs);
 
-                operations
-                    .fastest(fastest_index)
-                    .execute(inputs)
-                    .expect("Should run when selected by autotune.")
+                execute_with_fallback(&operations, fastest_index, inputs)
             }
             TuneCacheResult::Unchecked | TuneCacheResult::Miss => {
                 panic!(
@@ -185,6 +179,46 @@ where
                 }
                 panic!("All autotune operations failed, no viable operation found.");
             }
+        }
+    }
+}
+
+/// Run the autotune-selected operation, falling back to the other candidates if it fails
+/// to launch.
+///
+/// A cached "fastest" can become invalid for a later call that shares the autotune key but
+/// differs in a way the key does not capture (e.g. an operand layout that routes a matmul
+/// to a kernel variant unsupported on this hardware). When that happens we must NOT panic
+/// — a single misbehaving candidate would otherwise take down the whole process and
+/// cascade into thousands of "missing handle" panics from every dependent op. Instead, try
+/// the remaining operations in order and only give up if every one fails.
+fn execute_with_fallback<'a, AK: AutotuneKey, I: TuneInputs, Out: 'static>(
+    operations: &TunableSet<AK, I, Out>,
+    fastest_index: usize,
+    inputs: <I as TuneInputs>::At<'a>,
+) -> Out
+where
+    <I as TuneInputs>::At<'a>: Clone,
+{
+    match operations.fastest(fastest_index).execute(inputs.clone()) {
+        Ok(out) => out,
+        Err(err) => {
+            log::warn!(
+                "Autotune-selected operation #{fastest_index} failed at launch ({err}); \
+                 falling back to the other candidates."
+            );
+            for i in 0..operations.len() {
+                if i == fastest_index {
+                    continue;
+                }
+                if let Ok(out) = operations.fastest(i).execute(inputs.clone()) {
+                    return out;
+                }
+            }
+            panic!(
+                "Autotune-selected operation #{fastest_index} failed and no fallback \
+                 candidate succeeded: {err}"
+            );
         }
     }
 }
