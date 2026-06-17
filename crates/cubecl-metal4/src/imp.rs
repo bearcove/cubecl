@@ -53,6 +53,28 @@ fn timing_enabled() -> bool {
     TIMING_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Stable, source-derived key for AOT metallib lookup/capture (filename-safe hex).
+/// Hashing the exact MSL keeps capture (dump) and runtime (load) in agreement
+/// without threading cubecl's `KernelId` into the device layer.
+fn source_key(source: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Capture: write the kernel's MSL to `<dir>/<key>.metal` (verbatim, so the file's
+/// content hashes back to `key`). An offline step compiles each to `<key>.metallib`
+/// for the iOS SDK; the entrypoint name is embedded in the source.
+fn dump_msl(dir: &str, key: &str, _name: &str, source: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let path = std::path::Path::new(dir).join(format!("{key}.metal"));
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::write(&path, source);
+}
+
 /// A native Metal 4 runtime context on one device.
 pub struct Metal4 {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -313,17 +335,33 @@ impl Metal4 {
     /// Compile MSL `source` and build a compute pipeline for entry point `name`.
     pub fn compile(&self, source: &str, name: &str) -> Result<Pipeline, String> {
         // Diagnostic: split the two on-device compile phases — `newLibraryWithSource`
-        // (MSL front-end → AIR) vs `newComputePipelineState` (back-end GPU codegen) —
-        // to decide what a cross-launch cache must persist. On iPhone the sum of these
-        // is the ~30 s warmup. Gated so it costs nothing normally.
+        // (MSL front-end → AIR) vs `newComputePipelineState` (back-end GPU codegen).
+        // On iPhone the front-end dominates the (variable) warmup; the AOT metallib
+        // path below skips it. Gated so it costs nothing normally.
         let timing = std::env::var("METAL4_COMPILE_TIMING").is_ok();
 
-        let opts = MTLCompileOptions::new();
+        // Source-keyed so capture (offline) and load (runtime) agree without threading
+        // the cubecl `KernelId` down here.
+        let key = source_key(source);
+
         let t0 = timing.then(std::time::Instant::now);
-        let library = self
-            .device
-            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
-            .map_err(|e| format!("MSL compile failed: {e}"))?;
+        // AOT fast path: load a precompiled `.metallib` for this kernel (built offline
+        // for the iOS SDK) instead of compiling MSL on-device. Eliminates the variable
+        // `newLibraryWithSource` front-end — the bulk of the iPhone cold-start warmup.
+        let library = match self.try_load_metallib(&key) {
+            Some(lib) => lib,
+            None => {
+                // Capture: dump the MSL so it can be AOT-compiled offline (see
+                // scripts that run `xcrun --sdk iphoneos metal … && metallib`).
+                if let Ok(dir) = std::env::var("METAL4_DUMP_MSL") {
+                    dump_msl(&dir, &key, name, source);
+                }
+                let opts = MTLCompileOptions::new();
+                self.device
+                    .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
+                    .map_err(|e| format!("MSL compile failed: {e}"))?
+            }
+        };
         let lib_ms = t0.map(|t| t.elapsed().as_secs_f32() * 1e3);
         let function = library
             .newFunctionWithName(&NSString::from_str(name))
@@ -338,6 +376,29 @@ impl Metal4 {
             eprintln!("METAL4_COMPILE lib_ms={lib_ms:.1} pso_ms={pso_ms:.1} name={name}");
         }
         Ok(Pipeline { state, name: name.to_string() })
+    }
+
+    /// Load a precompiled `<METAL4_METALLIB_DIR>/<key>.metallib` if present, else
+    /// `None` (fall back to on-device source compile). The dir is the app bundle's
+    /// shipped kernel cache on iOS.
+    fn try_load_metallib(
+        &self,
+        key: &str,
+    ) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
+        let dir = std::env::var("METAL4_METALLIB_DIR").ok()?;
+        let path = std::path::Path::new(&dir).join(format!("{key}.metallib"));
+        if !path.exists() {
+            return None;
+        }
+        let url =
+            objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        match self.device.newLibraryWithURL_error(&url) {
+            Ok(lib) => Some(lib),
+            Err(e) => {
+                eprintln!("METAL4 metallib load failed ({}): {e}", path.display());
+                None
+            }
+        }
     }
 
     /// Dispatch `pipeline` with `bindings` bound to argument-table slots
