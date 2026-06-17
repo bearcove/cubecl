@@ -38,9 +38,11 @@ impl DeviceService for Metal4Server {
 
         let (cd_x, cd_y, cd_z) = ctx.max_threads_per_threadgroup();
         let max_units_per_cube = cd_x.max(cd_y).max(cd_z);
-        // Threadgroup memory is ~32 KiB on Apple GPUs; query is not exposed via
-        // the slice of MTLDevice we bind, so use the documented floor.
-        let max_shared_memory_size = 32 * 1024;
+        // Real per-cube threadgroup memory (Apple M-series expose well above the
+        // old 32 KiB floor). Hardcoding 32 KiB starved the matmul autotune of its
+        // larger-tile candidates, forcing the scalar fallbacks that miscompute the
+        // codebook lhs. Query the device for the true limit.
+        let max_shared_memory_size = ctx.max_threadgroup_memory();
         let working_set = ctx.recommended_working_set_size().max(1 << 30);
 
         // Apple GPUs have simdgroup-matrix (cooperative-matrix / cmma) units —
