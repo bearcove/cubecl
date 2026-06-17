@@ -209,6 +209,13 @@ std::thread_local! {
     /// Heterogeneous map of service states owned by this thread.
     #[allow(clippy::type_complexity)]
     static STATES: RefCell<HashMap<TypeId, RefCell<Box<dyn Any + 'static>>>> = RefCell::new(HashMap::new());
+
+    /// Raw pointers to the service states whose borrow this thread is *currently* holding,
+    /// keyed by `TypeId`. Lets `act_on` be re-entrant (see its docs): a server op that
+    /// recursively calls back into the same server (e.g. a `write` that lazily reads
+    /// another resource on the same runner thread — `send` runs such calls inline) reuses
+    /// the live borrow instead of a second `borrow_mut`, which would panic.
+    static ACTIVE: RefCell<HashMap<TypeId, *mut Box<dyn Any + 'static>>> = RefCell::new(HashMap::new());
 }
 
 /// Internal runner logic to manage background thread spawning.
@@ -352,13 +359,41 @@ impl ChannelDeviceState {
 
 impl ChannelService {
     /// Borrows the service state from thread-local storage and passes it to `f`.
-    /// Panics if the state is already borrowed (re-entrant access).
+    ///
+    /// Re-entrant: if this thread already holds this state's borrow, `f` is run against the
+    /// live borrow instead of taking a second `borrow_mut` (which would panic with
+    /// `BorrowMutError`). This is needed because `send` runs recursive calls inline on the
+    /// runner thread — e.g. a `write` whose source is a lazily-read device buffer triggers a
+    /// `read` on the *same* server thread mid-write. Sound because the runner is
+    /// single-threaded and re-entry is strictly stack-nested: the outer frame is suspended
+    /// in the call below and does not touch the state until the nested call returns, so the
+    /// two `&mut` are exclusive in time, not aliased in use.
     fn act_on<R>(&self, f: impl FnOnce(&mut Box<dyn Any + 'static>) -> R) -> R {
+        // Re-entrant fast path: reuse the borrow this thread is already holding.
+        if let Some(ptr) = ACTIVE.with_borrow(|a| a.get(&self.type_id).copied()) {
+            // SAFETY: see method docs — single-threaded runner, strictly nested access.
+            return f(unsafe { &mut *ptr });
+        }
+
+        // Removes the `ACTIVE` entry on scope exit, including unwinding, so a panicking `f`
+        // can't leave a dangling pointer for a later re-entry to reuse.
+        struct ActiveGuard(TypeId);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                ACTIVE.with_borrow_mut(|a| {
+                    a.remove(&self.0);
+                });
+            }
+        }
+
         STATES.with_borrow(|map| {
             let cell = map.get(&self.type_id).expect("Service state not found");
             let mut guard = cell
                 .try_borrow_mut()
                 .expect("Service state is already borrowed");
+            let ptr: *mut Box<dyn Any + 'static> = &mut *guard;
+            ACTIVE.with_borrow_mut(|a| a.insert(self.type_id, ptr));
+            let _active = ActiveGuard(self.type_id);
             f(&mut guard)
         })
     }
