@@ -120,7 +120,14 @@ pub fn type_vectorized_definitions<D: Dialect>(
     f: &mut std::fmt::Formatter<'_>,
     items: &HashSet<Item<D>>,
 ) -> std::fmt::Result {
-    for item in items.iter().filter(|it| it.vectorization() > 1) {
+    // Sort by emitted name before declaring the vectorized structs: `items` is a
+    // HashSet, whose iteration order is randomized per process, so the struct
+    // declarations (`struct float_4 {…}`, `float_8`, …) come out in a different order
+    // every run -> byte-different source -> different hash, defeating the source-hash
+    // kernel cache / AOT capture.
+    let mut sorted: Vec<&Item<D>> = items.iter().filter(|it| it.vectorization() > 1).collect();
+    sorted.sort_unstable_by_key(|it| format!("{it}"));
+    for item in sorted {
         let elem = item.elem();
         let size = item.vectorization();
         let alignment = elem.size() * size;
