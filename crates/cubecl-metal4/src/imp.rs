@@ -24,6 +24,16 @@ use objc2_metal::{
 /// queue into an error instead of a hang).
 const WAIT_TIMEOUT_MS: u64 = 30_000;
 
+/// Process-global queue-commit counter. Bumped once per `commit_batch`, so a
+/// test holding only a `ComputeClient` can still assert the batching invariant
+/// (commits ≪ dispatches).
+static GLOBAL_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Total `commit_batch` calls across all Metal 4 contexts in this process.
+pub fn global_commit_count() -> u64 {
+    GLOBAL_COMMITS.load(Ordering::Relaxed)
+}
+
 /// A native Metal 4 runtime context on one device.
 pub struct Metal4 {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -440,6 +450,7 @@ impl Metal4 {
         let command_ptrs = NonNull::from(&mut command_ptr);
         unsafe { self.queue.commit_count(command_ptrs, 1) };
         self.commit_count.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_COMMITS.fetch_add(1, Ordering::Relaxed);
         let signal = self.next_signal.fetch_add(1, Ordering::Relaxed);
         let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.shared_event);
         self.queue.signalEvent_value(event, signal);
