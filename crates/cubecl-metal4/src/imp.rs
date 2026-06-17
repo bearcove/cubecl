@@ -237,6 +237,11 @@ impl Metal4 {
             .device
             .newBufferWithLength_options(bytes.max(1), MTLResourceOptions::StorageModeShared)
             .expect("MTLBuffer allocation failed");
+        // Zero-initialize: cubecl kernels (like wgpu's, which zero-inits buffers)
+        // assume fresh allocations are zeroed — some read-before-full-write
+        // (accumulation/reduction) and would otherwise pick up garbage → NaN.
+        // SAFETY: `raw` is a fresh shared-storage buffer of `bytes.max(1)` bytes.
+        unsafe { core::ptr::write_bytes(raw.contents().as_ptr() as *mut u8, 0, bytes.max(1)) };
         // Argument tables bind raw GPU addresses with no implicit residency, so
         // every buffer the GPU may touch must be registered in the queue's set.
         let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*raw);
