@@ -14,7 +14,11 @@ use cubecl_core::{
     server::ServerUtilities,
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
 };
-use cubecl_cpp::{register_supported_types, shared::CompilationOptions};
+use cubecl_cpp::{
+    DialectWmmaCompiler, register_supported_types,
+    metal::{MslDialect, arch::MetalArchitecture},
+    shared::{CompilationOptions, register_wmma_features},
+};
 use cubecl_runtime::{allocator::ContiguousMemoryLayoutPolicy, logging::ServerLogger};
 
 use crate::device::Metal4Device;
@@ -39,6 +43,14 @@ impl DeviceService for Metal4Server {
         let max_shared_memory_size = 32 * 1024;
         let working_set = ctx.recommended_working_set_size().max(1 << 30);
 
+        // Apple GPUs have simdgroup-matrix (cooperative-matrix / cmma) units —
+        // the same ones cubecl-cpp's MSL dialect targets for cubecl-wgpu's cmma
+        // matmul. Advertise them so the matmul autotune gets tile/cmma candidates
+        // (like CUDA's WMMA) instead of only the scalar unit/vecmat/naive ones,
+        // which mishandle the packed-u32 codebook lhs under fusion (cast.rs:28).
+        let wmma_combinations = MslDialect::supported_wmma_combinations(&MetalArchitecture::Metal3);
+        let min_tensor_cores_dim = if wmma_combinations.is_empty() { None } else { Some(8) };
+
         let topology = HardwareProperties {
             load_width: 128,
             plane_size_min: PLANE_SIZE,
@@ -50,7 +62,7 @@ impl DeviceService for Metal4Server {
             max_cube_dim: (cd_x, cd_y, cd_z),
             num_streaming_multiprocessors: None,
             num_tensor_cores: None,
-            min_tensor_cores_dim: None,
+            min_tensor_cores_dim,
             num_cpu_cores: None,
             max_vector_size: VectorSize::MAX,
             cube_mma_reserved_shared_memory: 0,
@@ -70,6 +82,9 @@ impl DeviceService for Metal4Server {
             TimingMethod::Device,
         );
         register_supported_types(&mut device_props);
+        // Register the simdgroup-matrix combinations into `features.matmul.cmma`
+        // so the matmul autotune can pick cmma tile candidates.
+        register_wmma_features(wmma_combinations, &mut device_props);
         device_props.register_type_usage(
             ElemType::Float(FloatKind::F16),
             cubecl_core::ir::features::TypeUsage::all(),
