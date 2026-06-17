@@ -231,7 +231,15 @@ pub mod shared {
         /// See also [`allocate_slice`]
         fn allocate_slices(&mut self, func: &mut Function) {
             for block in func.node_ids() {
-                for live_smem in self.at_block(block).clone() {
+                // Sort the live shared memories by id before assigning offsets:
+                // `at_block` returns a `HashSet`, whose iteration order is randomized
+                // per process, so iterating it directly assigns shared-memory offsets
+                // (e.g. `dynamic_shared_mem[0]` vs `[128]`) in a different order every
+                // run. That makes byte-identical kernels hash differently run-to-run,
+                // defeating any source-hash-keyed kernel cache / AOT capture.
+                let mut live_smems: Vec<Id> = self.at_block(block).iter().copied().collect();
+                live_smems.sort_unstable();
+                for live_smem in live_smems {
                     if !self.allocations.contains_key(&live_smem) {
                         let smem = self.shared_memories[&live_smem];
                         let offset = self.allocate_slice(block, smem.size(), smem.alignment);
