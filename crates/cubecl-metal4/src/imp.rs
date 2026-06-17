@@ -63,12 +63,24 @@ fn source_key(source: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Resolve a capture/load dir: relative paths land under the process temp dir
+/// (on iOS that's the app's writable sandbox `tmp/`, pullable via devicectl).
+fn resolve_dir(dir: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(dir);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::temp_dir().join(p)
+    }
+}
+
 /// Capture: write the kernel's MSL to `<dir>/<key>.metal` (verbatim, so the file's
 /// content hashes back to `key`). An offline step compiles each to `<key>.metallib`
 /// for the iOS SDK; the entrypoint name is embedded in the source.
 fn dump_msl(dir: &str, key: &str, _name: &str, source: &str) {
-    let _ = std::fs::create_dir_all(dir);
-    let path = std::path::Path::new(dir).join(format!("{key}.metal"));
+    let dir = resolve_dir(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{key}.metal"));
     if path.exists() {
         return;
     }
@@ -386,7 +398,7 @@ impl Metal4 {
         key: &str,
     ) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
         let dir = std::env::var("METAL4_METALLIB_DIR").ok()?;
-        let path = std::path::Path::new(&dir).join(format!("{key}.metallib"));
+        let path = resolve_dir(&dir).join(format!("{key}.metallib"));
         if !path.exists() {
             return None;
         }
