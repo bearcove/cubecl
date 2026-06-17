@@ -83,6 +83,10 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 unsafe impl Send for Pipeline {}
 unsafe impl Sync for Pipeline {}
+// SAFETY: a `Batch` is owned by exactly one stream and only touched under the
+// cubecl channel mutex; the Metal command objects it holds are not shared.
+unsafe impl Send for Batch {}
+unsafe impl Sync for Batch {}
 
 impl Buffer {
     /// GPU virtual address, for binding into an `MTL4ArgumentTable`.

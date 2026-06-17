@@ -25,6 +25,7 @@ pub struct Metal4Storage {
 
 /// A resolved Metal 4 resource: a GPU address + host pointer into a sub-range
 /// of a unified-memory `MTLBuffer`.
+#[derive(Debug)]
 pub struct Metal4Resource {
     /// GPU virtual address of the start of the sub-range (base address + offset),
     /// ready to bind into an `MTL4ArgumentTable`.
