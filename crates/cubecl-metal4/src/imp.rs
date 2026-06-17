@@ -279,18 +279,31 @@ impl Metal4 {
 
     /// Compile MSL `source` and build a compute pipeline for entry point `name`.
     pub fn compile(&self, source: &str, name: &str) -> Result<Pipeline, String> {
+        // Diagnostic: split the two on-device compile phases — `newLibraryWithSource`
+        // (MSL front-end → AIR) vs `newComputePipelineState` (back-end GPU codegen) —
+        // to decide what a cross-launch cache must persist. On iPhone the sum of these
+        // is the ~30 s warmup. Gated so it costs nothing normally.
+        let timing = std::env::var("METAL4_COMPILE_TIMING").is_ok();
+
         let opts = MTLCompileOptions::new();
+        let t0 = timing.then(std::time::Instant::now);
         let library = self
             .device
             .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
             .map_err(|e| format!("MSL compile failed: {e}"))?;
+        let lib_ms = t0.map(|t| t.elapsed().as_secs_f32() * 1e3);
         let function = library
             .newFunctionWithName(&NSString::from_str(name))
             .ok_or_else(|| format!("entry point `{name}` not found in compiled library"))?;
+        let t1 = timing.then(std::time::Instant::now);
         let state = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| format!("pipeline creation failed: {e}"))?;
+        if let (Some(lib_ms), Some(t1)) = (lib_ms, t1) {
+            let pso_ms = t1.elapsed().as_secs_f32() * 1e3;
+            eprintln!("METAL4_COMPILE lib_ms={lib_ms:.1} pso_ms={pso_ms:.1} name={name}");
+        }
         Ok(Pipeline { state, name: name.to_string() })
     }
 
