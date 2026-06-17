@@ -14,10 +14,10 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap,
-    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation,
-    MTLBuffer, MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLEvent, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions,
-    MTLSharedEvent, MTLSize,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity, MTL4VisibilityOptions,
+    MTLAllocation, MTLBuffer, MTLCompileOptions, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStages,
 };
 
 /// Host-side wait budget for a dispatch to retire (generous; turns a wedged
@@ -39,6 +39,29 @@ pub struct Metal4 {
     frequency_hz: u64,
     /// Byte stride of one timestamp counter-heap entry on this device.
     ts_entry_size: usize,
+    /// Total number of `commit` calls on the queue. Exposed so tests can assert
+    /// the batched server commits far fewer than once-per-dispatch.
+    commit_count: AtomicU64,
+}
+
+/// An **open** command buffer + compute encoder accumulating many dispatches
+/// before a single commit. This is the batched-launch lifecycle the server
+/// drives: [`Metal4::open_batch`] begins it once, [`Batch::encode_dispatch`]
+/// appends dispatches (each gets its own argument table but no commit), and
+/// [`Metal4::commit_batch`] ends + commits + signals exactly once.
+pub struct Batch {
+    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+    encoder: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>,
+    /// Number of dispatches encoded into this batch so far.
+    dispatches: usize,
+}
+
+impl Batch {
+    /// Number of dispatches encoded into this batch so far.
+    pub fn dispatches(&self) -> usize {
+        self.dispatches
+    }
 }
 
 /// An `MTLBuffer` allocation. On Apple Silicon `StorageModeShared` is unified
@@ -53,10 +76,24 @@ pub struct Pipeline {
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
+// SAFETY: `Buffer`/`Pipeline` wrap reference-counted Metal objects that are
+// thread-safe to retain/release; all *use* is serialized under the cubecl
+// channel mutex. These impls let them live in the (Send) storage/pipeline cache.
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
+unsafe impl Send for Pipeline {}
+unsafe impl Sync for Pipeline {}
+
 impl Buffer {
     /// GPU virtual address, for binding into an `MTL4ArgumentTable`.
-    fn gpu_address(&self) -> u64 {
+    pub(crate) fn gpu_address(&self) -> u64 {
         self.raw.gpuAddress()
+    }
+
+    /// Raw pointer to the shared (unified-memory) buffer contents, for host
+    /// read/write by the `ComputeStorage` layer. Valid for `len()` bytes.
+    pub(crate) fn contents_ptr(&self) -> *mut u8 {
+        self.raw.contents().as_ptr() as *mut u8
     }
 
     /// Byte length of the allocation.
@@ -125,12 +162,36 @@ impl Metal4 {
             next_signal: AtomicU64::new(1),
             frequency_hz,
             ts_entry_size,
+            commit_count: AtomicU64::new(0),
         })
+    }
+
+    /// Total queue commits so far. The batched server commits once per flush
+    /// (many dispatches), so `commit_count() ≪ dispatch_count` — the batching
+    /// invariant the M3 proof test asserts.
+    pub fn commit_count(&self) -> u64 {
+        self.commit_count.load(Ordering::Relaxed)
     }
 
     /// The Metal device name (for logging / device enumeration).
     pub fn name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Max threads per threadgroup `(x, y, z)` for this device.
+    pub fn max_threads_per_threadgroup(&self) -> (u32, u32, u32) {
+        let s = self.device.maxThreadsPerThreadgroup();
+        (s.width as u32, s.height as u32, s.depth as u32)
+    }
+
+    /// Largest single `MTLBuffer` this device can allocate, in bytes.
+    pub fn max_buffer_length(&self) -> u64 {
+        self.device.maxBufferLength() as u64
+    }
+
+    /// Recommended working-set size (≈ usable GPU memory) in bytes.
+    pub fn recommended_working_set_size(&self) -> u64 {
+        self.device.recommendedMaxWorkingSetSize()
     }
 
     /// Allocate a shared-storage buffer of `bytes` and register it resident.
@@ -181,7 +242,26 @@ impl Metal4 {
         groups: (u32, u32, u32),
         threads: (u32, u32, u32),
     ) -> Result<(), String> {
-        self.dispatch_inner(pipeline, bindings, groups, threads, None)
+        let addrs: Vec<u64> = bindings.iter().map(|b| b.gpu_address()).collect();
+        self.dispatch_inner(pipeline, &addrs, groups, threads, None)
+    }
+
+    /// Dispatch `pipeline` binding the given raw GPU `addresses` to argument-table
+    /// slots `0..addresses.len()` and block until the GPU retires the work.
+    ///
+    /// This is the binding model the cubecl launch path needs: the server gathers
+    /// each storage resource's `gpu_address + offset` (and an optional packed
+    /// scalar/metadata buffer) and hands them over in slot order. The buffers
+    /// backing those addresses must already be resident (every [`Buffer`] from
+    /// [`alloc`](Self::alloc) is).
+    pub fn dispatch_addresses(
+        &self,
+        pipeline: &Pipeline,
+        addresses: &[u64],
+        groups: (u32, u32, u32),
+        threads: (u32, u32, u32),
+    ) -> Result<(), String> {
+        self.dispatch_inner(pipeline, addresses, groups, threads, None)
     }
 
     /// Like [`dispatch`](Self::dispatch) but brackets the dispatch with a
@@ -203,7 +283,8 @@ impl Metal4 {
             .map_err(|e| format!("counter heap creation failed: {e}"))?;
         unsafe { heap.invalidateCounterRange(NSRange { location: 0, length: 2 }) };
 
-        self.dispatch_inner(pipeline, bindings, groups, threads, Some(&heap))?;
+        let addrs: Vec<u64> = bindings.iter().map(|b| b.gpu_address()).collect();
+        self.dispatch_inner(pipeline, &addrs, groups, threads, Some(&heap))?;
 
         // Resolve the two timestamps and convert ticks → ns.
         let data = unsafe { heap.resolveCounterRange(NSRange { location: 0, length: 2 }) }
@@ -234,14 +315,13 @@ impl Metal4 {
         })
     }
 
-    fn dispatch_inner(
-        &self,
-        pipeline: &Pipeline,
-        bindings: &[&Buffer],
-        groups: (u32, u32, u32),
-        threads: (u32, u32, u32),
-        timestamps: Option<&ProtocolObject<dyn MTL4CounterHeap>>,
-    ) -> Result<(), String> {
+    // ---- batched submission: open a command buffer, append many dispatches,
+    // commit once. This is the competitive path the cubecl server drives; the
+    // one-shot `dispatch*` above are thin wrappers over it (open→encode→commit).
+
+    /// Begin a batch: borrow an allocator, open a command buffer + one compute
+    /// encoder that subsequent `batch_dispatch` calls append to.
+    pub fn open_batch(&self) -> Result<Batch, String> {
         let allocator = {
             let pooled = self
                 .allocators
@@ -256,40 +336,72 @@ impl Metal4 {
                     .ok_or("device did not create an MTL4CommandAllocator")?,
             }
         };
-
         let cb = self
             .device
             .newCommandBuffer()
             .ok_or("device did not create an MTL4CommandBuffer")?;
-        cb.setLabel(Some(&NSString::from_str("cubecl.metal4.dispatch")));
+        cb.setLabel(Some(&NSString::from_str("cubecl.metal4.batch")));
         cb.beginCommandBufferWithAllocator(&allocator);
+        let encoder = cb
+            .computeCommandEncoder()
+            .ok_or("command buffer did not create a compute encoder")?;
+        Ok(Batch {
+            allocator,
+            cb,
+            encoder,
+            dispatches: 0,
+        })
+    }
 
+    /// Append one dispatch to an open `batch`. A conservative compute→compute
+    /// barrier precedes every dispatch after the first, so a kernel that reads a
+    /// previous kernel's output in the same batch sees its writes (MTL4 does no
+    /// automatic hazard tracking). `timestamps` writes a begin/end pair around
+    /// the dispatch into the heap at `(begin, end)` when provided.
+    pub fn batch_dispatch(
+        &self,
+        batch: &mut Batch,
+        pipeline: &Pipeline,
+        addresses: &[u64],
+        groups: (u32, u32, u32),
+        threads: (u32, u32, u32),
+        timestamps: Option<(&ProtocolObject<dyn MTL4CounterHeap>, usize, usize)>,
+    ) -> Result<(), String> {
         let table_desc = MTL4ArgumentTableDescriptor::new();
-        table_desc.setMaxBufferBindCount(bindings.len());
+        table_desc.setMaxBufferBindCount(addresses.len().max(1));
         table_desc.setInitializeBindings(true);
         let table = self
             .device
             .newArgumentTableWithDescriptor_error(&table_desc)
             .map_err(|e| format!("argument table creation failed: {e}"))?;
-        for (i, buf) in bindings.iter().enumerate() {
-            unsafe { table.setAddress_atIndex(buf.gpu_address(), i) };
+        for (i, &addr) in addresses.iter().enumerate() {
+            unsafe { table.setAddress_atIndex(addr, i) };
         }
 
-        let encoder = cb
-            .computeCommandEncoder()
-            .ok_or("command buffer did not create a compute encoder")?;
-        encoder.setComputePipelineState(&pipeline.state);
-        encoder.setArgumentTable(Some(&table));
-        if let Some(heap) = timestamps {
+        let enc = &batch.encoder;
+        if batch.dispatches > 0 {
+            // Intra-pass RAW/WAR guard between dispatches sharing one encoder:
+            // subsequent Dispatch-stage work waits for prior Dispatch-stage work
+            // in THIS encoder, with device-visible cache flush. (MTL4 does no
+            // automatic hazard tracking; this is the documented intra-pass form.)
+            enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Dispatch,
+                MTL4VisibilityOptions::Device,
+            );
+        }
+        enc.setComputePipelineState(&pipeline.state);
+        enc.setArgumentTable(Some(&table));
+        if let Some((heap, begin, _)) = timestamps {
             unsafe {
-                encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+                enc.writeTimestampWithGranularity_intoHeap_atIndex(
                     MTL4TimestampGranularity::Precise,
                     heap,
-                    0,
+                    begin,
                 )
             };
         }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: groups.0 as usize,
                 height: groups.1 as usize,
@@ -301,44 +413,67 @@ impl Metal4 {
                 depth: threads.2 as usize,
             },
         );
-        if let Some(heap) = timestamps {
+        if let Some((heap, _, end)) = timestamps {
             unsafe {
-                encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+                enc.writeTimestampWithGranularity_intoHeap_atIndex(
                     MTL4TimestampGranularity::Precise,
                     heap,
-                    1,
+                    end,
                 )
             };
         }
-        encoder.endEncoding();
-        cb.endCommandBuffer();
+        batch.dispatches += 1;
+        Ok(())
+    }
 
-        // Commit + signal a fresh value + host-wait on the shared event.
-        let mut command_ptr = NonNull::from(&*cb);
+    /// End the batch's encoder + command buffer, commit ONCE, signal, and host-
+    /// wait for the GPU to retire it. Bumps `commit_count` (one per batch).
+    pub fn commit_batch(&self, batch: Batch) -> Result<(), String> {
+        batch.encoder.endEncoding();
+        batch.cb.endCommandBuffer();
+
+        let mut command_ptr = NonNull::from(&*batch.cb);
         let command_ptrs = NonNull::from(&mut command_ptr);
         unsafe { self.queue.commit_count(command_ptrs, 1) };
+        self.commit_count.fetch_add(1, Ordering::Relaxed);
         let signal = self.next_signal.fetch_add(1, Ordering::Relaxed);
         let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.shared_event);
         self.queue.signalEvent_value(event, signal);
         let completed = self
             .shared_event
             .waitUntilSignaledValue_timeoutMS(signal, WAIT_TIMEOUT_MS);
-
         if !completed {
             // GPU may still consume the allocator's encoded commands → leak it.
             return Err(format!(
-                "dispatch timed out after {WAIT_TIMEOUT_MS} ms (event at {})",
+                "batch commit timed out after {WAIT_TIMEOUT_MS} ms (event at {})",
                 self.shared_event.signaledValue()
             ));
         }
-        allocator.reset();
+        batch.allocator.reset();
         if let Ok(mut pool) = self.allocators.lock() {
-            pool.push(allocator);
+            pool.push(batch.allocator);
         }
         Ok(())
     }
+
+    fn dispatch_inner(
+        &self,
+        pipeline: &Pipeline,
+        addresses: &[u64],
+        groups: (u32, u32, u32),
+        threads: (u32, u32, u32),
+        timestamps: Option<&ProtocolObject<dyn MTL4CounterHeap>>,
+    ) -> Result<(), String> {
+        let mut batch = self.open_batch()?;
+        let ts = timestamps.map(|h| (h, 0usize, 1usize));
+        self.batch_dispatch(&mut batch, pipeline, addresses, groups, threads, ts)?;
+        self.commit_batch(batch)
+    }
 }
 
-// SAFETY: `Metal4` is accessed single-threaded per context in M1; the Retained
-// Metal objects are internally reference-counted and thread-safe to retain/release.
+// SAFETY: `Metal4` is accessed single-threaded per context (the cubecl channel
+// serializes all server access under a mutex); the Retained Metal objects are
+// internally reference-counted and thread-safe to retain/release. `Sync` lets it
+// sit behind the `Arc` shared between the storage and the server.
 unsafe impl Send for Metal4 {}
+unsafe impl Sync for Metal4 {}
