@@ -690,6 +690,13 @@ mod custom_channel {
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
             let mut idle_count: u32 = 0;
+            // Observability for the sleep tier: a producer that drops to sleeping
+            // means the server (runner / GPU thread) is not draining the queue. A
+            // permanent stall there is otherwise indistinguishable from a hang (the
+            // signature we had to recover by `sample`-ing a stuck process). Track
+            // when the stall began and warn periodically with the elapsed time.
+            let mut stall_start: Option<std::time::Instant> = None;
+            let mut last_warn: Option<std::time::Instant> = None;
             loop {
                 let index = self.state.available_index.fetch_add(1, Ordering::Acquire) as usize;
                 if index >= CHANNEL_MAX_TASK {
@@ -699,12 +706,28 @@ mod custom_channel {
                     } else if idle_count < SPIN_BUDGET_CLIENT + YIELD_BUDGET_CLIENT {
                         std::thread::yield_now();
                     } else {
+                        let now = std::time::Instant::now();
+                        let start = *stall_start.get_or_insert(now);
+                        if last_warn.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+                        {
+                            log::warn!(
+                                "device submission channel full for {:?}: the runner/GPU thread is not draining the {CHANNEL_MAX_TASK}-slot queue; producer throttled (sleeping). A persistent stall here means GPU work is far slower than submission.",
+                                now.duration_since(start),
+                            );
+                            last_warn = Some(now);
+                        }
                         std::thread::sleep(SLEEP_STEP_CLIENT);
                     }
                     idle_count = idle_count.saturating_add(1);
                     continue;
                 }
 
+                if let Some(start) = stall_start {
+                    log::warn!(
+                        "device submission channel drained after {:?} stall; producer resuming.",
+                        start.elapsed(),
+                    );
+                }
                 self.state.init_task_at(index, func);
                 self.state.enqueued_count.fetch_add(1, Ordering::SeqCst);
                 return Ok(());
