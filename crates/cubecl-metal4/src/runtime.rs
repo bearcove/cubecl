@@ -91,9 +91,13 @@ impl DeviceService for Metal4Server {
             ElemType::Float(FloatKind::F16),
             cubecl_core::ir::features::TypeUsage::all(),
         );
-        // Apple simdgroups support the plane (subgroup) shuffle/reduction ops the
-        // cubek kernels use.
+        // Match cubecl-wgpu's Apple/MSL feature advertisement exactly: aligned
+        // memory access + BOTH plane capabilities (Ops = shuffle/reduce, Sync =
+        // simdgroup barrier). Omitting `alignment`/`Plane::Sync` starved/miscompiled
+        // the matmul candidates that rely on them.
+        device_props.features.alignment = true;
         device_props.features.plane.insert(Plane::Ops);
+        device_props.features.plane.insert(Plane::Sync);
 
         let mut comp_opts = CompilationOptions::default();
         comp_opts.warp_size = PLANE_SIZE;
