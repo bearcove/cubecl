@@ -348,6 +348,23 @@ where
     /// Initializes [memory](ManagedMemoryHandle) on the given [stream](StreamId) with the given size.
     fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId);
 
+    /// Register **external, caller-owned** memory (`ptr`, `len` bytes) as a zero-copy
+    /// buffer on `stream_id` and return a handle to it — no allocation, no copy. Used
+    /// for mmap'd weights (the pack is page-aligned per tensor). Backends without
+    /// foreign-buffer support leave this `unimplemented!`.
+    ///
+    /// # Safety
+    /// `ptr` must be page-aligned, valid for `len` bytes, and the caller MUST keep the
+    /// backing mapping alive for at least as long as any handle/GPU work referencing it.
+    unsafe fn create_external(
+        &mut self,
+        _ptr: u64,
+        _len: usize,
+        _stream_id: StreamId,
+    ) -> ManagedMemoryHandle {
+        unimplemented!("create_external (zero-copy foreign buffers) not supported by this backend")
+    }
+
     /// Reserves N [Bytes] of the provided sizes to be used as staging to load data.
     fn staging(
         &mut self,

@@ -270,6 +270,39 @@ impl Metal4 {
         Buffer { raw, len: bytes }
     }
 
+    /// Wrap **external, caller-owned** memory as a shared `MTLBuffer` WITHOUT
+    /// copying (`newBufferWithBytesNoCopy`). Used for zero-copy weight load: the
+    /// pack is mmap'd and each tensor is 16 KB page-aligned (the packer guarantees
+    /// this), so its bytes can back a GPU buffer directly — no 1.2 GB memcpy and no
+    /// duplicate resident copy.
+    ///
+    /// `deallocator: None` ⇒ Metal never frees `ptr`; the caller MUST keep the
+    /// backing mapping (`memmap2::Mmap`) alive for at least as long as the returned
+    /// `Buffer` (and any GPU work referencing it).
+    ///
+    /// # Safety
+    /// - `ptr` must be page-aligned and valid for `len` bytes for the buffer's
+    ///   lifetime (Apple-silicon page size is 16 KB; `len` is rounded up to it).
+    /// - The region must outlive every dispatch that binds this buffer.
+    pub unsafe fn alloc_no_copy(&self, ptr: *mut u8, len: usize) -> Buffer {
+        const PAGE: usize = 16 * 1024;
+        let padded = len.div_ceil(PAGE) * PAGE;
+        let raw = unsafe {
+            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
+                NonNull::new(ptr as *mut c_void).expect("alloc_no_copy: null ptr"),
+                padded,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        }
+        .expect("newBufferWithBytesNoCopy failed (ptr must be page-aligned)");
+        // Argument tables bind raw GPU addresses with no implicit residency.
+        let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*raw);
+        self.residency_set.addAllocation(alloc);
+        self.residency_set.commit();
+        Buffer { raw, len }
+    }
+
     /// Allocate a buffer initialized from `data`.
     pub fn buffer_from<T: Copy>(&self, data: &[T]) -> Buffer {
         let buf = self.alloc(core::mem::size_of_val(data));

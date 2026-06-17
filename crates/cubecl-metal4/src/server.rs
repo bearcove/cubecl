@@ -510,6 +510,20 @@ impl ComputeServer for Metal4Server {
         stream.bind(reserved, memory);
     }
 
+    unsafe fn create_external(
+        &mut self,
+        ptr: u64,
+        len: usize,
+        stream_id: StreamId,
+    ) -> ManagedMemoryHandle {
+        let stream = self.scheduler.stream(&stream_id);
+        // Wrap the caller's (mmap'd) memory as a no-copy MTLBuffer, register it as a
+        // foreign storage entry, and hand back a handle that lives outside the pools.
+        let storage_handle =
+            unsafe { stream.memory_management.storage_mut().register_external(ptr as *mut u8, len) };
+        stream.memory_management.reserve_external(storage_handle)
+    }
+
     fn read(
         &mut self,
         descriptors: Vec<CopyDescriptor>,
