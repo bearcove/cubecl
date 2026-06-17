@@ -10,7 +10,7 @@
 
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
-use cubecl_metal4::Metal4Runtime;
+use cubecl_metal4::{Metal4Runtime, set_dispatch_timing, take_dispatch_ns};
 
 /// Warp = one output column. Lane strides over K by the plane width; each lane
 /// dequantizes its weight codes on read (4-bit, 8 codes/u32) against a shared
@@ -125,4 +125,27 @@ fn qa_gemv_parity() {
     }
     assert!(max_rel < 1e-4, "qa_gemv parity: max_rel {max_rel} too high");
     println!("cubek qa_gemv parity OK on metal4: N={n} K={k}, max_rel {max_rel:.2e}");
+
+    // Real per-kernel GPU ns through the batched launch path (MTL4 counter heap).
+    let _ = take_dispatch_ns();
+    set_dispatch_timing(true);
+    unsafe {
+        qa_gemv::launch_unchecked::<f32, Metal4Runtime>(
+            &client,
+            CubeCount::Static(cubes, 1, 1),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(client.create_from_slice(f32::as_bytes(&a)), k),
+            BufferArg::from_raw_parts(client.create_from_slice(u32::as_bytes(&codes)), n * k / 8),
+            BufferArg::from_raw_parts(client.create_from_slice(f32::as_bytes(&scales)), n * units),
+            BufferArg::from_raw_parts(client.create_from_slice(f32::as_bytes(&LUT16)), 16),
+            BufferArg::from_raw_parts(client.empty(n * 4), n),
+            k as u32,
+        );
+    }
+    let _ = client.sync();
+    set_dispatch_timing(false);
+    let ns = take_dispatch_ns();
+    assert!(!ns.is_empty(), "no GPU dispatch timing recorded");
+    assert!(ns.iter().all(|&t| t > 0), "GPU ns should be > 0: {ns:?}");
+    println!("cubek qa_gemv real GPU time: {ns:?} ns per dispatch");
 }

@@ -34,6 +34,25 @@ pub fn global_commit_count() -> u64 {
     GLOBAL_COMMITS.load(Ordering::Relaxed)
 }
 
+/// When set, every batched dispatch is bracketed with MTL4 counter-heap
+/// timestamps and its real GPU duration is recorded (see [`take_dispatch_ns`]).
+static TIMING_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RECORDED_NS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Enable/disable per-dispatch GPU timing through the batched launch path.
+pub fn set_dispatch_timing(on: bool) {
+    TIMING_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Drain the per-dispatch GPU durations (ns) recorded since the last drain.
+pub fn take_dispatch_ns() -> Vec<u64> {
+    core::mem::take(&mut RECORDED_NS.lock().unwrap())
+}
+
+fn timing_enabled() -> bool {
+    TIMING_ENABLED.load(Ordering::Relaxed)
+}
+
 /// A native Metal 4 runtime context on one device.
 pub struct Metal4 {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -65,6 +84,10 @@ pub struct Batch {
     encoder: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>,
     /// Number of dispatches encoded into this batch so far.
     dispatches: usize,
+    /// Per-dispatch timestamp heap (2 entries each), present only when timing is
+    /// enabled. Capacity bounds the batch to `cap/2` timed dispatches.
+    heap: Option<Retained<ProtocolObject<dyn MTL4CounterHeap>>>,
+    heap_cap: usize,
 }
 
 impl Batch {
@@ -359,11 +382,29 @@ impl Metal4 {
         let encoder = cb
             .computeCommandEncoder()
             .ok_or("command buffer did not create a compute encoder")?;
+        // When timing, allocate a heap with room for 2 timestamps per dispatch up
+        // to the scheduler's task cap.
+        let (heap, heap_cap) = if timing_enabled() {
+            let cap = 256usize; // ≥ 2 * max_tasks
+            let desc = MTL4CounterHeapDescriptor::new();
+            desc.setType(MTL4CounterHeapType::Timestamp);
+            unsafe { desc.setCount(cap) };
+            let heap = self
+                .device
+                .newCounterHeapWithDescriptor_error(&desc)
+                .map_err(|e| format!("counter heap creation failed: {e}"))?;
+            unsafe { heap.invalidateCounterRange(NSRange { location: 0, length: cap }) };
+            (Some(heap), cap)
+        } else {
+            (None, 0)
+        };
         Ok(Batch {
             allocator,
             cb,
             encoder,
             dispatches: 0,
+            heap,
+            heap_cap,
         })
     }
 
@@ -392,8 +433,18 @@ impl Metal4 {
             unsafe { table.setAddress_atIndex(addr, i) };
         }
 
+        let idx = batch.dispatches;
+        // Effective timestamp target: an explicit one (one-shot `dispatch_timed`)
+        // or the batch's own heap (auto, when global timing is enabled).
+        let ts: Option<(&ProtocolObject<dyn MTL4CounterHeap>, usize, usize)> = match timestamps {
+            Some(t) => Some(t),
+            None => match &batch.heap {
+                Some(h) if 2 * idx + 1 < batch.heap_cap => Some((h, 2 * idx, 2 * idx + 1)),
+                _ => None,
+            },
+        };
         let enc = &batch.encoder;
-        if batch.dispatches > 0 {
+        if idx > 0 {
             // Intra-pass RAW/WAR guard between dispatches sharing one encoder:
             // subsequent Dispatch-stage work waits for prior Dispatch-stage work
             // in THIS encoder, with device-visible cache flush. (MTL4 does no
@@ -406,7 +457,7 @@ impl Metal4 {
         }
         enc.setComputePipelineState(&pipeline.state);
         enc.setArgumentTable(Some(&table));
-        if let Some((heap, begin, _)) = timestamps {
+        if let Some((heap, begin, _)) = ts {
             unsafe {
                 enc.writeTimestampWithGranularity_intoHeap_atIndex(
                     MTL4TimestampGranularity::Precise,
@@ -427,7 +478,7 @@ impl Metal4 {
                 depth: threads.2 as usize,
             },
         );
-        if let Some((heap, _, end)) = timestamps {
+        if let Some((heap, _, end)) = ts {
             unsafe {
                 enc.writeTimestampWithGranularity_intoHeap_atIndex(
                     MTL4TimestampGranularity::Precise,
@@ -438,6 +489,45 @@ impl Metal4 {
         }
         batch.dispatches += 1;
         Ok(())
+    }
+
+    /// Resolve a batch's per-dispatch timestamp heap into nanoseconds.
+    fn resolve_batch_ns(&self, heap: &ProtocolObject<dyn MTL4CounterHeap>, dispatches: usize) {
+        let entries = 2 * dispatches;
+        if entries == 0 {
+            return;
+        }
+        let Some(data) =
+            (unsafe { heap.resolveCounterRange(NSRange { location: 0, length: entries }) })
+        else {
+            return;
+        };
+        let mut bytes = vec![0u8; data.length()];
+        if !bytes.is_empty() {
+            unsafe {
+                data.getBytes_length(
+                    NonNull::new(bytes.as_mut_ptr().cast::<c_void>()).unwrap(),
+                    bytes.len(),
+                );
+            }
+        }
+        let read = |i: usize| -> u64 {
+            let start = i * self.ts_entry_size;
+            bytes
+                .get(start..start + 8)
+                .map(|r| u64::from_ne_bytes(r.try_into().unwrap()))
+                .unwrap_or(0)
+        };
+        let mut out = RECORDED_NS.lock().unwrap();
+        for d in 0..dispatches {
+            let ticks = read(2 * d + 1).saturating_sub(read(2 * d));
+            let ns = if self.frequency_hz > 0 {
+                ((ticks as u128) * 1_000_000_000 / self.frequency_hz as u128) as u64
+            } else {
+                ticks
+            };
+            out.push(ns);
+        }
     }
 
     /// End the batch's encoder + command buffer, commit ONCE, signal, and host-
@@ -463,6 +553,10 @@ impl Metal4 {
                 "batch commit timed out after {WAIT_TIMEOUT_MS} ms (event at {})",
                 self.shared_event.signaledValue()
             ));
+        }
+        // Record per-dispatch GPU durations (auto-timing path).
+        if let Some(heap) = &batch.heap {
+            self.resolve_batch_ns(heap, batch.dispatches);
         }
         batch.allocator.reset();
         if let Ok(mut pool) = self.allocators.lock() {
