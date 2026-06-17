@@ -244,6 +244,13 @@ impl Metal4 {
         self.device.recommendedMaxWorkingSetSize()
     }
 
+    /// Max threadgroup (shared) memory per cube, in bytes — the real device
+    /// limit, not a hardcoded floor. Drives which matmul tiling candidates the
+    /// autotune may use.
+    pub fn max_threadgroup_memory(&self) -> usize {
+        self.device.maxThreadgroupMemoryLength()
+    }
+
     /// Allocate a shared-storage buffer of `bytes` and register it resident.
     pub fn alloc(&self, bytes: usize) -> Buffer {
         let raw = self
