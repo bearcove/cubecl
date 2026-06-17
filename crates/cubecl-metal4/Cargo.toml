@@ -16,10 +16,12 @@ std = []
 
 # Everything here is Apple/Metal-only. On other targets the crate is an empty
 # lib so the workspace (`members = ["crates/*"]`) still builds on Linux/CUDA boxes.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 cubecl-common = { path = "../cubecl-common", version = "=0.11.0-pre.1", default-features = false, features = [
     "compilation-cache",
     "hash",
+    "std",
+    "serde",
 ] }
 cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.1", default-features = false }
 cubecl-cpp = { path = "../cubecl-cpp", version = "=0.11.0-pre.1", default-features = false, features = [
@@ -57,7 +59,7 @@ objc2-metal = { version = "0.3.2", features = [
 ] }
 block2 = "0.6"
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
 cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.1" }
 bytemuck = { workspace = true }
 half = { workspace = true }
