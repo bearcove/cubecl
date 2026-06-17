@@ -30,7 +30,8 @@ use cubecl_runtime::{
     kernel::CompiledKernel,
     logging::ServerLogger,
     memory_management::{
-        ManagedMemoryHandle, MemoryAllocationMode, MemoryManagement, MemoryManagementOptions,
+        ManagedMemoryBinding, ManagedMemoryHandle, MemoryAllocationMode, MemoryManagement,
+        MemoryManagementOptions,
     },
     storage::{ComputeStorage, ManagedResource},
     stream::{
@@ -81,6 +82,12 @@ impl core::fmt::Debug for ScheduleTask {
 #[derive(Debug)]
 pub struct BindingsResource {
     pub resources: Vec<Metal4Resource>,
+    /// The memory-pool bindings backing `resources`. We bind by raw `gpu_address`
+    /// into the MTL4 argument table, so nothing else holds a refcount on these
+    /// pool slices — they MUST be retained until the batch commits, otherwise a
+    /// dropped tensor's slice is recycled and overwritten while the queued (not
+    /// yet committed) kernel still reads it (observed as audio-encoder NaN).
+    pub handles: Vec<ManagedMemoryBinding>,
     pub info: MetadataBindingInfo,
 }
 
@@ -98,6 +105,10 @@ pub struct Metal4Stream {
     /// `info`/metadata buffers created for in-flight dispatches; kept alive until
     /// the batch commits, then cleared.
     transient: Vec<Buffer>,
+    /// Memory-pool bindings referenced by dispatches in the open batch. Held so
+    /// the pool can't recycle a slice the uncommitted GPU work still reads; freed
+    /// on commit.
+    in_flight: Vec<ManagedMemoryBinding>,
     errors: Vec<ServerError>,
 }
 
@@ -155,6 +166,8 @@ impl Metal4Stream {
             addresses.push(info_buf.gpu_address());
             self.transient.push(info_buf);
         }
+        // Pin the bound pool slices until this batch commits (see BindingsResource).
+        self.in_flight.extend(bindings.handles);
 
         if self.batch.is_none() {
             self.batch = Some(self.ctx.open_batch()?);
@@ -179,6 +192,8 @@ impl Metal4Stream {
             }
         }
         self.transient.clear();
+        // GPU work retired (commit blocks); the bound slices can now be recycled.
+        self.in_flight.clear();
         Ok(())
     }
 
@@ -286,6 +301,7 @@ impl StreamFactory for Metal4StreamFactory {
             timestamps: TimestampProfiler::default(),
             batch: None,
             transient: Vec::new(),
+            in_flight: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -413,10 +429,14 @@ impl Metal4Server {
     }
 
     fn prepare_bindings(&mut self, bindings: KernelArguments) -> BindingsResource {
+        let mut handles = Vec::with_capacity(bindings.buffers.len());
         let resources = bindings
             .buffers
             .into_iter()
             .map(|binding| {
+                // Clone the pool binding so the slice stays reserved until the
+                // batch commits (we bind by raw gpu_address, nothing else pins it).
+                handles.push(binding.memory.clone());
                 let stream = self.scheduler.stream(&binding.stream);
                 stream
                     .memory_management
@@ -426,6 +446,7 @@ impl Metal4Server {
             .collect::<Vec<_>>();
         BindingsResource {
             resources,
+            handles,
             info: bindings.info,
         }
     }
