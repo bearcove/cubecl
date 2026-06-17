@@ -88,6 +88,10 @@ pub struct Batch {
     /// enabled. Capacity bounds the batch to `cap/2` timed dispatches.
     heap: Option<Retained<ProtocolObject<dyn MTL4CounterHeap>>>,
     heap_cap: usize,
+    /// Per-dispatch stax span metadata `(label, begin_index, end_index, origin)`,
+    /// captured at encode time and resolved to GPU spans on commit. Empty unless a
+    /// stax recording is active.
+    spans: Vec<(String, u32, u32, crate::stax_lane::Origin)>,
 }
 
 impl Batch {
@@ -107,6 +111,15 @@ pub struct Buffer {
 /// A compiled MSL compute pipeline.
 pub struct Pipeline {
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Entry-point name, used as the stax GPU-span label for this kernel.
+    name: String,
+}
+
+impl Pipeline {
+    /// The kernel's entry-point name (stax span label).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 // SAFETY: `Buffer`/`Pipeline` wrap reference-counted Metal objects that are
@@ -271,7 +284,7 @@ impl Metal4 {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| format!("pipeline creation failed: {e}"))?;
-        Ok(Pipeline { state })
+        Ok(Pipeline { state, name: name.to_string() })
     }
 
     /// Dispatch `pipeline` with `bindings` bound to argument-table slots
@@ -387,9 +400,10 @@ impl Metal4 {
         let encoder = cb
             .computeCommandEncoder()
             .ok_or("command buffer did not create a compute encoder")?;
-        // When timing, allocate a heap with room for 2 timestamps per dispatch up
-        // to the scheduler's task cap.
-        let (heap, heap_cap) = if timing_enabled() {
+        // When timing (explicit `set_dispatch_timing`, or a live stax recording),
+        // allocate a heap with room for 2 timestamps per dispatch up to the
+        // scheduler's task cap.
+        let (heap, heap_cap) = if timing_enabled() || crate::stax_lane::reporting_active() {
             let cap = 256usize; // ≥ 2 * max_tasks
             let desc = MTL4CounterHeapDescriptor::new();
             desc.setType(MTL4CounterHeapType::Timestamp);
@@ -410,6 +424,7 @@ impl Metal4 {
             dispatches: 0,
             heap,
             heap_cap,
+            spans: Vec::new(),
         })
     }
 
@@ -426,6 +441,7 @@ impl Metal4 {
         groups: (u32, u32, u32),
         threads: (u32, u32, u32),
         timestamps: Option<(&ProtocolObject<dyn MTL4CounterHeap>, usize, usize)>,
+        label: &str,
     ) -> Result<(), String> {
         let table_desc = MTL4ArgumentTableDescriptor::new();
         table_desc.setMaxBufferBindCount(addresses.len().max(1));
@@ -448,6 +464,9 @@ impl Metal4 {
                 _ => None,
             },
         };
+        // Copy out the heap indices (no borrow on `batch`) so we can record the
+        // stax span after the encoder block without fighting the borrow checker.
+        let stax_idx: Option<(u32, u32)> = ts.map(|(_, b, e)| (b as u32, e as u32));
         let enc = &batch.encoder;
         if idx > 0 {
             // Intra-pass RAW/WAR guard between dispatches sharing one encoder:
@@ -493,6 +512,15 @@ impl Metal4 {
             };
         }
         batch.dispatches += 1;
+        // Record the stax span (label + CPU origin) for this dispatch; resolved to
+        // a GPU span on commit. Only when a stax recording is live.
+        if let Some((begin, end)) = stax_idx {
+            if crate::stax_lane::reporting_active() {
+                batch
+                    .spans
+                    .push((label.to_string(), begin, end, crate::stax_lane::capture_origin()));
+            }
+        }
         Ok(())
     }
 
@@ -535,6 +563,46 @@ impl Metal4 {
         }
     }
 
+    /// Resolve the batch's per-dispatch spans into absolute-tick GPU spans and
+    /// report them to the stax target lane (per-kernel timing under the CPU stack
+    /// that dispatched). No-op build when the `stax` feature is off.
+    fn resolve_batch_stax(
+        &self,
+        heap: &ProtocolObject<dyn MTL4CounterHeap>,
+        spans: &[(String, u32, u32, crate::stax_lane::Origin)],
+    ) {
+        let entries = match spans.iter().map(|(_, _, e, _)| *e).max() {
+            Some(m) => m as usize + 1,
+            None => return,
+        };
+        let Some(data) =
+            (unsafe { heap.resolveCounterRange(NSRange { location: 0, length: entries }) })
+        else {
+            return;
+        };
+        let mut bytes = vec![0u8; data.length()];
+        if !bytes.is_empty() {
+            unsafe {
+                data.getBytes_length(
+                    NonNull::new(bytes.as_mut_ptr().cast::<c_void>()).unwrap(),
+                    bytes.len(),
+                );
+            }
+        }
+        let read = |i: u32| -> u64 {
+            let start = i as usize * self.ts_entry_size;
+            bytes
+                .get(start..start + 8)
+                .map(|r| u64::from_ne_bytes(r.try_into().unwrap()))
+                .unwrap_or(0)
+        };
+        let resolved: Vec<_> = spans
+            .iter()
+            .map(|(label, b, e, origin)| (label.clone(), read(*b), read(*e), origin.clone()))
+            .collect();
+        crate::stax_lane::report(self.frequency_hz, resolved);
+    }
+
     /// End the batch's encoder + command buffer, commit ONCE, signal, and host-
     /// wait for the GPU to retire it. Bumps `commit_count` (one per batch).
     pub fn commit_batch(&self, batch: Batch) -> Result<(), String> {
@@ -559,9 +627,12 @@ impl Metal4 {
                 self.shared_event.signaledValue()
             ));
         }
-        // Record per-dispatch GPU durations (auto-timing path).
+        // Record per-dispatch GPU durations (auto-timing path) + stax spans.
         if let Some(heap) = &batch.heap {
             self.resolve_batch_ns(heap, batch.dispatches);
+            if !batch.spans.is_empty() {
+                self.resolve_batch_stax(heap, &batch.spans);
+            }
         }
         batch.allocator.reset();
         if let Ok(mut pool) = self.allocators.lock() {
@@ -580,7 +651,7 @@ impl Metal4 {
     ) -> Result<(), String> {
         let mut batch = self.open_batch()?;
         let ts = timestamps.map(|h| (h, 0usize, 1usize));
-        self.batch_dispatch(&mut batch, pipeline, addresses, groups, threads, ts)?;
+        self.batch_dispatch(&mut batch, pipeline, addresses, groups, threads, ts, pipeline.name())?;
         self.commit_batch(batch)
     }
 }

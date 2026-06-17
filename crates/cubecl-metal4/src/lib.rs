@@ -20,6 +20,8 @@ mod runtime;
 #[cfg(target_vendor = "apple")]
 mod server;
 #[cfg(target_vendor = "apple")]
+mod stax_lane;
+#[cfg(target_vendor = "apple")]
 mod storage;
 
 #[cfg(target_vendor = "apple")]
