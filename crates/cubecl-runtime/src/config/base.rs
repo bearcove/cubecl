@@ -133,6 +133,12 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             }
         }
 
+        if let Ok(val) = std::env::var("CUBECL_MAX_STREAMS")
+            && let Ok(n) = val.parse::<u8>()
+        {
+            self.streaming.max_streams = n;
+        }
+
         self
     }
 }
