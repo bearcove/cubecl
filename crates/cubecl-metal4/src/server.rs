@@ -180,6 +180,7 @@ impl Metal4Stream {
             (cube_count[0], cube_count[1], cube_count[2]),
             (cube_dim.x, cube_dim.y, cube_dim.z),
             None,
+            pipeline.name(),
         )
     }
 
@@ -204,15 +205,41 @@ impl Metal4Stream {
                 backtrace: BackTrace::capture(),
             }));
         }
-        if mode.flush || !mode.ignore {
-            if !mode.ignore && !self.errors.is_empty() {
+        self.flush_errors(mode)
+    }
+
+    /// Surface accumulated task errors (mirrors cubecl-cpu). On a flushing call we
+    /// DRAIN them (the stream returns to healthy so the next op — e.g. the next
+    /// autotune candidate — runs fresh) and also feed them to the timestamp
+    /// profiler, so `end_profile` reports the real cause (the `{:?}` Debug carries
+    /// each error's description, which `IoError::Unknown`'s Display drops).
+    fn flush_errors(&mut self, mode: StreamErrorMode) -> Result<(), ServerError> {
+        if mode.flush {
+            let errors = self.flush_errors_queue();
+            if !mode.ignore && !errors.is_empty() {
                 return Err(ServerError::ServerUnhealthy {
-                    errors: self.errors.clone(),
+                    errors,
                     backtrace: BackTrace::capture(),
                 });
             }
+        } else if !mode.ignore && !self.errors.is_empty() {
+            return Err(ServerError::ServerUnhealthy {
+                errors: self.errors.clone(),
+                backtrace: BackTrace::capture(),
+            });
         }
         Ok(())
+    }
+
+    fn flush_errors_queue(&mut self) -> Vec<ServerError> {
+        let errors = core::mem::take(&mut self.errors);
+        if !errors.is_empty() {
+            self.timestamps.error(ProfileError::Unknown {
+                reason: format!("{errors:?}"),
+                backtrace: BackTrace::capture(),
+            });
+        }
+        errors
     }
 
     fn is_healthy(&self) -> bool {

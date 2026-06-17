@@ -13,6 +13,10 @@ workspace = true
 [features]
 default = ["std"]
 std = []
+# Report per-dispatch Metal 4 counter-heap timestamps to a stax target lane
+# (per-kernel GPU spans under the dispatching CPU stack). Opt-in: pulls the
+# private `stax-target` crate, so the default public build never links it.
+stax = ["dep:stax-target"]
 
 # Everything here is Apple/Metal-only. On other targets the crate is an empty
 # lib so the workspace (`members = ["crates/*"]`) still builds on Linux/CUDA boxes.
@@ -58,6 +62,9 @@ objc2-metal = { version = "0.3.2", features = [
   "dispatch2",
 ] }
 block2 = "0.6"
+# Optional: report per-dispatch GPU timestamps to a stax target lane (the `stax`
+# feature). Path dep to Amos's stax checkout; only linked when the feature is on.
+stax-target = { path = "../../../stax/stax-target", optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 # `export_tests` exposes cubecl's golden-vector kernel suite (reduce, softmax,
