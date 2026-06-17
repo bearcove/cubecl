@@ -66,7 +66,13 @@ impl DeviceService for Metal4Server {
             num_tensor_cores: None,
             min_tensor_cores_dim,
             num_cpu_cores: None,
-            max_vector_size: VectorSize::MAX,
+            // Metal's widest native vector is 4 lanes (e.g. `float4`); there is no
+            // float8/float16. `VectorSize::MAX` (usize::MAX) left the line-size /
+            // vectorizer unclamped (client.rs clamps with `min(max_vector_size, …)`),
+            // so it picked widths Metal can't represent → autotune candidates panicked
+            // in `cast.rs` ("Cast element count must match") and, under multi-stream,
+            // produced nondeterministic garbage. Matches Metal-3 backend + wgpu/Vulkan.
+            max_vector_size: 4,
             cube_mma_reserved_shared_memory: 0,
         };
 

@@ -1,7 +1,13 @@
 use cubecl_common::device::{Device, DeviceId};
 
-/// Upper bound on live argument-table buffer bindings tracked per dispatch.
-pub const METAL4_MAX_BINDINGS: u32 = 1024;
+/// Max buffer bindings Burn may pack into one (fused) kernel. Metal allows 31
+/// buffer slots in the argument table; reserve one for the per-kernel `info`
+/// buffer → 30. The fusion engine reads this to bound how many input tensors it
+/// folds into a single kernel; advertising more than Metal supports lets it
+/// over-fuse, the excess bindings silently never bind, and the kernel reads
+/// zeros (observed as near-zero fused-decode output / no-op layers, 2026-06-17).
+/// Matches the value the upstream Metal-3 backend (cubecl-metal) uses.
+pub const METAL4_MAX_BINDINGS: u32 = 30;
 
 /// A Metal 4 device handle, addressed by index (Apple systems expose one GPU,
 /// so index 0 is the system-default device).
