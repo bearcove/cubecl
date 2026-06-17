@@ -13,6 +13,9 @@ pub use cubecl_cuda as cuda;
 #[cfg(feature = "hip")]
 pub use cubecl_hip as hip;
 
+#[cfg(feature = "metal4")]
+pub use cubecl_metal4 as metal4;
+
 #[cfg(feature = "stdlib")]
 pub use cubecl_std as std;
 

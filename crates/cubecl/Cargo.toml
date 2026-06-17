@@ -48,6 +48,8 @@ cuda-ptx-wmma = ["cubecl-cuda?/ptx-wmma"]
 hip = ["cubecl-hip"]
 hip-rocwmma = ["cubecl-hip?/rocwmma"]
 metal = ["wgpu-msl"]
+# Native Metal 4 runtime (Apple only; empty elsewhere).
+metal4 = ["cubecl-metal4"]
 rocm = ["hip"]
 spirv-dump = ["cubecl-wgpu/spirv-dump"]
 vulkan = ["wgpu-spirv"]
@@ -64,6 +66,7 @@ cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.1", default-feat
 cubecl-cpu = { path = "../cubecl-cpu", version = "=0.11.0-pre.1", default-features = false, optional = true }
 cubecl-cuda = { path = "../cubecl-cuda", version = "=0.11.0-pre.1", default-features = false, optional = true }
 cubecl-hip = { path = "../cubecl-hip", version = "=0.11.0-pre.1", default-features = false, optional = true }
+cubecl-metal4 = { path = "../cubecl-metal4", version = "=0.11.0-pre.1", default-features = false, optional = true }
 cubecl-ir = { path = "../cubecl-ir", version = "=0.11.0-pre.1", default-features = false }
 cubecl-runtime = { path = "../cubecl-runtime", version = "=0.11.0-pre.1", default-features = false }
 cubecl-std = { path = "../cubecl-std", version = "=0.11.0-pre.1", optional = true }
