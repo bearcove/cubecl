@@ -6,15 +6,18 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::ffi::c_void;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTLAllocation, MTLBuffer,
-    MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent,
-    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent,
-    MTLSize,
+    MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation,
+    MTLBuffer, MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLEvent, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions,
+    MTLSharedEvent, MTLSize,
 };
 
 /// Host-side wait budget for a dispatch to retire (generous; turns a wedged
@@ -32,6 +35,10 @@ pub struct Metal4 {
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
     /// Strictly-increasing signal value (never 0 — a shared event starts at 0).
     next_signal: AtomicU64,
+    /// GPU timestamp ticks per second (for `dispatch_timed` ns conversion).
+    frequency_hz: u64,
+    /// Byte stride of one timestamp counter-heap entry on this device.
+    ts_entry_size: usize,
 }
 
 /// An `MTLBuffer` allocation. On Apple Silicon `StorageModeShared` is unified
@@ -106,6 +113,9 @@ impl Metal4 {
         residency_set.requestResidency();
         queue.addResidencySet(&residency_set);
 
+        let frequency_hz = device.queryTimestampFrequency();
+        let ts_entry_size = device.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
+
         Ok(Self {
             device,
             queue,
@@ -113,6 +123,8 @@ impl Metal4 {
             shared_event,
             residency_set,
             next_signal: AtomicU64::new(1),
+            frequency_hz,
+            ts_entry_size,
         })
     }
 
@@ -169,6 +181,67 @@ impl Metal4 {
         groups: (u32, u32, u32),
         threads: (u32, u32, u32),
     ) -> Result<(), String> {
+        self.dispatch_inner(pipeline, bindings, groups, threads, None)
+    }
+
+    /// Like [`dispatch`](Self::dispatch) but brackets the dispatch with a
+    /// **Metal 4 counter-heap timestamp pair** (`Precise` granularity) and
+    /// returns the real on-GPU kernel duration in nanoseconds.
+    pub fn dispatch_timed(
+        &self,
+        pipeline: &Pipeline,
+        bindings: &[&Buffer],
+        groups: (u32, u32, u32),
+        threads: (u32, u32, u32),
+    ) -> Result<u64, String> {
+        let desc = MTL4CounterHeapDescriptor::new();
+        desc.setType(MTL4CounterHeapType::Timestamp);
+        unsafe { desc.setCount(2) };
+        let heap = self
+            .device
+            .newCounterHeapWithDescriptor_error(&desc)
+            .map_err(|e| format!("counter heap creation failed: {e}"))?;
+        unsafe { heap.invalidateCounterRange(NSRange { location: 0, length: 2 }) };
+
+        self.dispatch_inner(pipeline, bindings, groups, threads, Some(&heap))?;
+
+        // Resolve the two timestamps and convert ticks → ns.
+        let data = unsafe { heap.resolveCounterRange(NSRange { location: 0, length: 2 }) }
+            .ok_or("timestamp resolve returned no data")?;
+        let mut bytes = vec![0u8; data.length()];
+        if !bytes.is_empty() {
+            unsafe {
+                data.getBytes_length(
+                    NonNull::new(bytes.as_mut_ptr().cast::<c_void>()).unwrap(),
+                    bytes.len(),
+                );
+            }
+        }
+        let read = |i: usize| -> Result<u64, String> {
+            let start = i * self.ts_entry_size;
+            let raw = bytes
+                .get(start..start + 8)
+                .ok_or("timestamp entry out of range")?;
+            Ok(u64::from_ne_bytes(raw.try_into().unwrap()))
+        };
+        let begin = read(0)?;
+        let end = read(1)?;
+        let ticks = end.saturating_sub(begin);
+        Ok(if self.frequency_hz > 0 {
+            ((ticks as u128) * 1_000_000_000 / self.frequency_hz as u128) as u64
+        } else {
+            ticks
+        })
+    }
+
+    fn dispatch_inner(
+        &self,
+        pipeline: &Pipeline,
+        bindings: &[&Buffer],
+        groups: (u32, u32, u32),
+        threads: (u32, u32, u32),
+        timestamps: Option<&ProtocolObject<dyn MTL4CounterHeap>>,
+    ) -> Result<(), String> {
         let allocator = {
             let pooled = self
                 .allocators
@@ -207,6 +280,15 @@ impl Metal4 {
             .ok_or("command buffer did not create a compute encoder")?;
         encoder.setComputePipelineState(&pipeline.state);
         encoder.setArgumentTable(Some(&table));
+        if let Some(heap) = timestamps {
+            unsafe {
+                encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+                    MTL4TimestampGranularity::Precise,
+                    heap,
+                    0,
+                )
+            };
+        }
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: groups.0 as usize,
@@ -219,6 +301,15 @@ impl Metal4 {
                 depth: threads.2 as usize,
             },
         );
+        if let Some(heap) = timestamps {
+            unsafe {
+                encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+                    MTL4TimestampGranularity::Precise,
+                    heap,
+                    1,
+                )
+            };
+        }
         encoder.endEncoding();
         cb.endCommandBuffer();
 
