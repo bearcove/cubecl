@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use cubecl_core::server::IoError;
 use cubecl_runtime::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
 
 use crate::imp::{Buffer, Metal4};
 
@@ -34,6 +37,11 @@ pub struct Metal4Resource {
     pub ptr: *mut u8,
     /// Size of the sub-range in bytes.
     pub size: usize,
+    /// Retained handle to the backing `MTLBuffer`, so the launch path can declare
+    /// it resident in the command buffer's own residency set (raw-`gpuAddress`
+    /// binding carries no implicit residency). Keeps the buffer alive for the
+    /// resource's lifetime.
+    pub allocation: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 // SAFETY: the underlying memory is owned by `Metal4Storage`, which is only
@@ -73,16 +81,12 @@ impl Metal4Storage {
     }
 
     fn perform_deallocations(&mut self) {
-        let ids: Vec<_> = self.deallocations.drain(..).collect();
-        // Collect the buffers, remove them from the residency set under the
-        // residency lock in one batch (`addAllocation:` retained them; without
-        // removal the set grows unbounded and they never free), THEN drop them.
-        let bufs: Vec<Buffer> = ids
-            .into_iter()
-            .filter_map(|id| self.memory.remove(&id))
-            .collect();
-        self.ctx.free_allocations(&bufs);
-        drop(bufs);
+        // Dropping the `Buffer` releases the `MTLBuffer`. Residency was per command
+        // buffer (each batch's own set, released when the batch retired), so there
+        // is no global set to remove from — just drop.
+        for id in self.deallocations.drain(..) {
+            self.memory.remove(&id);
+        }
     }
 
     /// Register **external, caller-owned** memory as a no-copy buffer and return a
@@ -126,6 +130,7 @@ impl ComputeStorage for Metal4Storage {
             // memory manager that produced this handle.
             ptr: unsafe { buffer.contents_ptr().add(offset as usize) },
             size: size as usize,
+            allocation: buffer.retained(),
         }
     }
 

@@ -22,6 +22,9 @@ use cubecl_core::{
     zspace::{Shape, Strides, strides},
 };
 use cubecl_cpp::shared::CompilationOptions;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLAllocation, MTLBuffer};
 use cubecl_runtime::{
     allocator::ContiguousMemoryLayoutPolicy,
     compiler::CubeTask,
@@ -160,14 +163,24 @@ impl Metal4Stream {
         // Buffer slots: each binding's GPU address in order, then the appended
         // metadata/scalars buffer (CppCompiler's `info`).
         let mut addresses: Vec<u64> = bindings.resources.iter().map(|r| r.gpu_address).collect();
+        // Allocations this dispatch binds — declared resident on THIS command
+        // buffer's own residency set (raw `gpuAddress` argument tables carry no
+        // implicit residency). Retained clones are cheap and keep the buffers
+        // alive across the dispatch.
+        let mut alloc_holders: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> =
+            bindings.resources.iter().map(|r| r.allocation.clone()).collect();
         if !bindings.info.data.is_empty() {
             let info_buf =
                 self.ctx.buffer_from(bytemuck::cast_slice::<u64, u8>(&bindings.info.data));
             addresses.push(info_buf.gpu_address());
+            alloc_holders.push(info_buf.retained());
             self.transient.push(info_buf);
         }
         // Pin the bound pool slices until this batch commits (see BindingsResource).
         self.in_flight.extend(bindings.handles);
+
+        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> =
+            alloc_holders.iter().map(|b| ProtocolObject::from_ref(&**b)).collect();
 
         if self.batch.is_none() {
             self.batch = Some(self.ctx.open_batch()?);
@@ -177,6 +190,7 @@ impl Metal4Stream {
             batch,
             &pipeline,
             &addresses,
+            &residents,
             (cube_count[0], cube_count[1], cube_count[2]),
             (cube_dim.x, cube_dim.y, cube_dim.z),
             None,

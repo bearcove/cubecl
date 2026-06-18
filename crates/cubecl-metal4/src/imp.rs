@@ -95,14 +95,6 @@ pub struct Metal4 {
     /// back into the pool after the GPU retires the work.
     allocators: Mutex<Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>>>,
     shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    /// Serializes MUTATION of `residency_set` (`addAllocation`/`removeAllocation`
-    /// /`commit`). `MTLResidencySet` is not thread-safe, and allocations happen
-    /// concurrently from every stream thread — unsynchronized mutation corrupts
-    /// the set's internal storage and aborts inside `addAllocation:`. This guards
-    /// only the microsecond-scale bookkeeping calls; it does NOT serialize GPU
-    /// work, command-buffer submission, or the streams, so concurrency is intact.
-    residency_lock: Mutex<()>,
     /// Strictly-increasing signal value (never 0 — a shared event starts at 0).
     next_signal: AtomicU64,
     /// GPU timestamp ticks per second (for `dispatch_timed` ns conversion).
@@ -123,6 +115,14 @@ pub struct Batch {
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     encoder: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>,
+    /// This command buffer's OWN residency set: the working set of allocations its
+    /// dispatches bind (raw `gpuAddress` argument tables carry no implicit
+    /// residency). Built during encoding, committed before submit, immutable while
+    /// the command buffer is in flight — so it is never mutated by another stream
+    /// or while the GPU references it. No shared queue-wide set, no lock: full
+    /// concurrency. Dropped (releasing its retained buffers) after the batch
+    /// retires in `commit_batch`.
+    residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
     /// Number of dispatches encoded into this batch so far.
     dispatches: usize,
     /// Per-dispatch timestamp heap (2 entries each), present only when timing is
@@ -181,6 +181,12 @@ impl Buffer {
         self.raw.gpuAddress()
     }
 
+    /// A retained handle to the underlying allocation, for adding to a
+    /// per-command-buffer residency set. Cheap (one retain).
+    pub(crate) fn retained(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        self.raw.clone()
+    }
+
     /// Raw pointer to the shared (unified-memory) buffer contents, for host
     /// read/write by the `ComputeStorage` layer. Valid for `len()` bytes.
     pub(crate) fn contents_ptr(&self) -> *mut u8 {
@@ -232,20 +238,10 @@ impl Metal4 {
             .newSharedEvent()
             .ok_or("device did not create an MTLSharedEvent")?;
 
-        let desc = MTLResidencySetDescriptor::new();
-        desc.setLabel(Some(&NSString::from_str("cubecl.metal4.residency")));
-        // The set is effectively fixed-size at this capacity — `addAllocation:`
-        // aborts past it (NOT a graceful grow). 128 only covered inference; a
-        // training backward holds its whole graph's intermediates resident at
-        // once (thousands of buffers), so size for the peak working set.
-        // `free_allocation` (removeAllocation on dealloc) keeps it from growing
-        // across iterations, so this bounds peak-live, not lifetime-total.
-        unsafe { desc.setInitialCapacity(1 << 18) };
-        let residency_set = device
-            .newResidencySetWithDescriptor_error(&desc)
-            .map_err(|e| format!("device did not create an MTLResidencySet: {e}"))?;
-        residency_set.requestResidency();
-        queue.addResidencySet(&residency_set);
+        // Residency is now PER COMMAND BUFFER (see `Batch::residency_set` /
+        // `open_batch`): each command buffer carries its own immutable set of the
+        // allocations it binds, so there is no shared queue-wide set to mutate
+        // while work is in flight (which aborted under concurrent streams).
 
         let frequency_hz = device.queryTimestampFrequency();
         let ts_entry_size = device.sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
@@ -255,8 +251,6 @@ impl Metal4 {
             queue,
             allocators: Mutex::new(vec![first_allocator]),
             shared_event,
-            residency_set,
-            residency_lock: Mutex::new(()),
             next_signal: AtomicU64::new(1),
             frequency_hz,
             ts_entry_size,
@@ -310,14 +304,10 @@ impl Metal4 {
         // (accumulation/reduction) and would otherwise pick up garbage → NaN.
         // SAFETY: `raw` is a fresh shared-storage buffer of `bytes.max(1)` bytes.
         unsafe { core::ptr::write_bytes(raw.contents().as_ptr() as *mut u8, 0, bytes.max(1)) };
-        // Argument tables bind raw GPU addresses with no implicit residency, so
-        // every buffer the GPU may touch must be registered in the queue's set.
-        let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*raw);
-        {
-            let _g = self.residency_lock.lock().unwrap();
-            self.residency_set.addAllocation(alloc);
-            self.residency_set.commit();
-        }
+        // Residency is registered per command buffer when this buffer is bound by
+        // a dispatch (see `batch_dispatch` / `Batch::residency_set`), not here —
+        // raw-`gpuAddress` argument tables still carry no implicit residency, but
+        // the working set is now declared on the command buffer that uses it.
         Buffer { raw, len: bytes }
     }
 
@@ -347,32 +337,8 @@ impl Metal4 {
             )
         }
         .expect("newBufferWithBytesNoCopy failed (ptr must be page-aligned)");
-        // Argument tables bind raw GPU addresses with no implicit residency.
-        let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*raw);
-        {
-            let _g = self.residency_lock.lock().unwrap();
-            self.residency_set.addAllocation(alloc);
-            self.residency_set.commit();
-        }
+        // Residency declared per command buffer at bind time (see `batch_dispatch`).
         Buffer { raw, len }
-    }
-
-    /// Remove a batch of buffers from the queue residency set under the residency
-    /// lock (one commit for the batch). MUST be called before the `Buffer`s drop:
-    /// `addAllocation:` RETAINS the allocation, so without removal the set grows
-    /// unbounded and the buffers never free. Same lock as `alloc` — concurrent
-    /// mutation of the non-thread-safe set from multiple stream threads is what
-    /// aborts inside `addAllocation:`/`removeAllocation:`.
-    pub fn free_allocations(&self, bufs: &[Buffer]) {
-        if bufs.is_empty() {
-            return;
-        }
-        let _g = self.residency_lock.lock().unwrap();
-        for buf in bufs {
-            let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*buf.raw);
-            self.residency_set.removeAllocation(alloc);
-        }
-        self.residency_set.commit();
     }
 
     /// Allocate a buffer initialized from `data`.
@@ -462,25 +428,9 @@ impl Metal4 {
         threads: (u32, u32, u32),
     ) -> Result<(), String> {
         let addrs: Vec<u64> = bindings.iter().map(|b| b.gpu_address()).collect();
-        self.dispatch_inner(pipeline, &addrs, groups, threads, None)
-    }
-
-    /// Dispatch `pipeline` binding the given raw GPU `addresses` to argument-table
-    /// slots `0..addresses.len()` and block until the GPU retires the work.
-    ///
-    /// This is the binding model the cubecl launch path needs: the server gathers
-    /// each storage resource's `gpu_address + offset` (and an optional packed
-    /// scalar/metadata buffer) and hands them over in slot order. The buffers
-    /// backing those addresses must already be resident (every [`Buffer`] from
-    /// [`alloc`](Self::alloc) is).
-    pub fn dispatch_addresses(
-        &self,
-        pipeline: &Pipeline,
-        addresses: &[u64],
-        groups: (u32, u32, u32),
-        threads: (u32, u32, u32),
-    ) -> Result<(), String> {
-        self.dispatch_inner(pipeline, addresses, groups, threads, None)
+        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> =
+            bindings.iter().map(|b| ProtocolObject::from_ref(&*b.raw)).collect();
+        self.dispatch_inner(pipeline, &addrs, &residents, groups, threads, None)
     }
 
     /// Like [`dispatch`](Self::dispatch) but brackets the dispatch with a
@@ -503,7 +453,9 @@ impl Metal4 {
         unsafe { heap.invalidateCounterRange(NSRange { location: 0, length: 2 }) };
 
         let addrs: Vec<u64> = bindings.iter().map(|b| b.gpu_address()).collect();
-        self.dispatch_inner(pipeline, &addrs, groups, threads, Some(&heap))?;
+        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> =
+            bindings.iter().map(|b| ProtocolObject::from_ref(&*b.raw)).collect();
+        self.dispatch_inner(pipeline, &addrs, &residents, groups, threads, Some(&heap))?;
 
         // Resolve the two timestamps and convert ticks → ns.
         let data = unsafe { heap.resolveCounterRange(NSRange { location: 0, length: 2 }) }
@@ -561,6 +513,21 @@ impl Metal4 {
             .ok_or("device did not create an MTL4CommandBuffer")?;
         cb.setLabel(Some(&NSString::from_str("cubecl.metal4.batch")));
         cb.beginCommandBufferWithAllocator(&allocator);
+
+        // This command buffer's own residency set. `beginCommandBufferWithAllocator`
+        // RESETS any prior `useResidencySet`, so it must be (re)attached here, after
+        // begin. Dispatches add their bound allocations to it during encoding; it is
+        // committed in `commit_batch` before submit and stays immutable while the
+        // command buffer is in flight — no shared queue-wide set, no cross-stream
+        // mutation, no lock.
+        let rdesc = MTLResidencySetDescriptor::new();
+        rdesc.setLabel(Some(&NSString::from_str("cubecl.metal4.batch.residency")));
+        let residency_set = self
+            .device
+            .newResidencySetWithDescriptor_error(&rdesc)
+            .map_err(|e| format!("device did not create an MTLResidencySet: {e}"))?;
+        cb.useResidencySet(&residency_set);
+
         let encoder = cb
             .computeCommandEncoder()
             .ok_or("command buffer did not create a compute encoder")?;
@@ -585,6 +552,7 @@ impl Metal4 {
             allocator,
             cb,
             encoder,
+            residency_set,
             dispatches: 0,
             heap,
             heap_cap,
@@ -602,11 +570,20 @@ impl Metal4 {
         batch: &mut Batch,
         pipeline: &Pipeline,
         addresses: &[u64],
+        residents: &[&ProtocolObject<dyn MTLAllocation>],
         groups: (u32, u32, u32),
         threads: (u32, u32, u32),
         timestamps: Option<(&ProtocolObject<dyn MTL4CounterHeap>, usize, usize)>,
         label: &str,
     ) -> Result<(), String> {
+        // Register every allocation this dispatch binds into THIS command buffer's
+        // residency set (raw-`gpuAddress` argument tables carry no implicit
+        // residency). The set is this batch's own — single-threaded, not yet in
+        // flight — so no lock and no cross-stream hazard. Committed once before
+        // submit (`commit_batch`).
+        for alloc in residents {
+            batch.residency_set.addAllocation(alloc);
+        }
         let table_desc = MTL4ArgumentTableDescriptor::new();
         table_desc.setMaxBufferBindCount(addresses.len().max(1));
         table_desc.setInitializeBindings(true);
@@ -770,6 +747,14 @@ impl Metal4 {
     /// End the batch's encoder + command buffer, commit ONCE, signal, and host-
     /// wait for the GPU to retire it. Bumps `commit_count` (one per batch).
     pub fn commit_batch(&self, batch: Batch) -> Result<(), String> {
+        // Finalize this command buffer's residency set (apply all the allocations
+        // its dispatches added) and page them in, BEFORE submit. The set was bound
+        // via `useResidencySet` at `open_batch`; from here it is immutable while
+        // the command buffer is in flight, and is released when `batch` drops
+        // (after the host-wait below).
+        batch.residency_set.commit();
+        batch.residency_set.requestResidency();
+
         batch.encoder.endEncoding();
         batch.cb.endCommandBuffer();
 
@@ -809,13 +794,23 @@ impl Metal4 {
         &self,
         pipeline: &Pipeline,
         addresses: &[u64],
+        residents: &[&ProtocolObject<dyn MTLAllocation>],
         groups: (u32, u32, u32),
         threads: (u32, u32, u32),
         timestamps: Option<&ProtocolObject<dyn MTL4CounterHeap>>,
     ) -> Result<(), String> {
         let mut batch = self.open_batch()?;
         let ts = timestamps.map(|h| (h, 0usize, 1usize));
-        self.batch_dispatch(&mut batch, pipeline, addresses, groups, threads, ts, pipeline.name())?;
+        self.batch_dispatch(
+            &mut batch,
+            pipeline,
+            addresses,
+            residents,
+            groups,
+            threads,
+            ts,
+            pipeline.name(),
+        )?;
         self.commit_batch(batch)
     }
 }
