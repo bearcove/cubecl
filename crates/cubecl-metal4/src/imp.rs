@@ -96,6 +96,13 @@ pub struct Metal4 {
     allocators: Mutex<Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>>>,
     shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    /// Serializes MUTATION of `residency_set` (`addAllocation`/`removeAllocation`
+    /// /`commit`). `MTLResidencySet` is not thread-safe, and allocations happen
+    /// concurrently from every stream thread — unsynchronized mutation corrupts
+    /// the set's internal storage and aborts inside `addAllocation:`. This guards
+    /// only the microsecond-scale bookkeeping calls; it does NOT serialize GPU
+    /// work, command-buffer submission, or the streams, so concurrency is intact.
+    residency_lock: Mutex<()>,
     /// Strictly-increasing signal value (never 0 — a shared event starts at 0).
     next_signal: AtomicU64,
     /// GPU timestamp ticks per second (for `dispatch_timed` ns conversion).
@@ -249,6 +256,7 @@ impl Metal4 {
             allocators: Mutex::new(vec![first_allocator]),
             shared_event,
             residency_set,
+            residency_lock: Mutex::new(()),
             next_signal: AtomicU64::new(1),
             frequency_hz,
             ts_entry_size,
@@ -305,8 +313,11 @@ impl Metal4 {
         // Argument tables bind raw GPU addresses with no implicit residency, so
         // every buffer the GPU may touch must be registered in the queue's set.
         let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*raw);
-        self.residency_set.addAllocation(alloc);
-        self.residency_set.commit();
+        {
+            let _g = self.residency_lock.lock().unwrap();
+            self.residency_set.addAllocation(alloc);
+            self.residency_set.commit();
+        }
         Buffer { raw, len: bytes }
     }
 
@@ -338,24 +349,29 @@ impl Metal4 {
         .expect("newBufferWithBytesNoCopy failed (ptr must be page-aligned)");
         // Argument tables bind raw GPU addresses with no implicit residency.
         let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*raw);
-        self.residency_set.addAllocation(alloc);
-        self.residency_set.commit();
+        {
+            let _g = self.residency_lock.lock().unwrap();
+            self.residency_set.addAllocation(alloc);
+            self.residency_set.commit();
+        }
         Buffer { raw, len }
     }
 
-    /// Remove a buffer's allocation from the queue residency set. MUST be called
-    /// before the `Buffer` is dropped: `addAllocation:` RETAINS the allocation, so
-    /// without this the set grows unbounded (every transient tensor leaks into it)
-    /// until `-[IOGPUMetalResidencySet addAllocation:]` aborts — and the buffers
-    /// never actually free. Caller should `commit_residency` after a batch of
-    /// removals (residency-set edits only take effect on commit).
-    pub fn free_allocation(&self, buf: &Buffer) {
-        let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*buf.raw);
-        self.residency_set.removeAllocation(alloc);
-    }
-
-    /// Commit pending residency-set edits (after a batch of `free_allocation`).
-    pub fn commit_residency(&self) {
+    /// Remove a batch of buffers from the queue residency set under the residency
+    /// lock (one commit for the batch). MUST be called before the `Buffer`s drop:
+    /// `addAllocation:` RETAINS the allocation, so without removal the set grows
+    /// unbounded and the buffers never free. Same lock as `alloc` — concurrent
+    /// mutation of the non-thread-safe set from multiple stream threads is what
+    /// aborts inside `addAllocation:`/`removeAllocation:`.
+    pub fn free_allocations(&self, bufs: &[Buffer]) {
+        if bufs.is_empty() {
+            return;
+        }
+        let _g = self.residency_lock.lock().unwrap();
+        for buf in bufs {
+            let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*buf.raw);
+            self.residency_set.removeAllocation(alloc);
+        }
         self.residency_set.commit();
     }
 

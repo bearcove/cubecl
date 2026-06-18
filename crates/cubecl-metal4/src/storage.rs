@@ -74,20 +74,15 @@ impl Metal4Storage {
 
     fn perform_deallocations(&mut self) {
         let ids: Vec<_> = self.deallocations.drain(..).collect();
-        let mut removed = false;
-        for id in ids {
-            if let Some(buf) = self.memory.remove(&id) {
-                // `addAllocation:` retained this buffer in the queue residency
-                // set; remove it BEFORE dropping `buf`, or the set grows
-                // unbounded (→ `addAllocation:` abort) and the buffer never frees.
-                self.ctx.free_allocation(&buf);
-                removed = true;
-            }
-        }
-        // Residency-set edits only take effect on commit; do it once per batch.
-        if removed {
-            self.ctx.commit_residency();
-        }
+        // Collect the buffers, remove them from the residency set under the
+        // residency lock in one batch (`addAllocation:` retained them; without
+        // removal the set grows unbounded and they never free), THEN drop them.
+        let bufs: Vec<Buffer> = ids
+            .into_iter()
+            .filter_map(|id| self.memory.remove(&id))
+            .collect();
+        self.ctx.free_allocations(&bufs);
+        drop(bufs);
     }
 
     /// Register **external, caller-owned** memory as a no-copy buffer and return a
