@@ -33,6 +33,9 @@ impl Hash for Codebook {
     }
 }
 
+/// TQ2 (`Q2F`) codebook: 4 Lloyd-Max levels for a unit-variance Gaussian.
+pub const Q2F: [f32; 4] = [-1.510_400, -0.452_800, 0.452_800, 1.510_400];
+
 /// TQ4 (`Q4F`) codebook: 16 Lloyd-Max levels for a unit-variance Gaussian.
 pub const Q4F: [f32; 16] = [
     -2.732590, -2.069017, -1.618046, -1.256231, -0.942340, -0.656759, -0.388048, -0.128395,
@@ -59,6 +62,7 @@ pub const Q6F: [f32; 64] = [
 /// off for them).
 pub fn codebook_for(value: QuantValue) -> Codebook {
     match value {
+        QuantValue::Q2F => Codebook(&Q2F),
         QuantValue::Q4F => Codebook(&Q4F),
         QuantValue::Q6F => Codebook(&Q6F),
         _ => Codebook(&[]),
