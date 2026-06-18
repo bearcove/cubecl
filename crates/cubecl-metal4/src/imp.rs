@@ -375,10 +375,20 @@ impl Metal4 {
         // for the iOS SDK) instead of compiling MSL on-device. Eliminates the variable
         // `newLibraryWithSource` front-end — the bulk of the iPhone cold-start warmup.
         let library = match self.try_load_metallib(&key) {
-            Some(lib) => lib,
+            Some(lib) => {
+                // DIRECT evidence of the AOT path (not inferred from timing): this kernel
+                // was served from the shipped `.metallib` bundle, no on-device compile.
+                if timing {
+                    eprintln!("METAL4_AOT_HIT key={key} name={name}");
+                }
+                lib
+            }
             None => {
                 // Capture: dump the MSL so it can be AOT-compiled offline (see
                 // scripts that run `xcrun --sdk iphoneos metal … && metallib`).
+                if timing {
+                    eprintln!("METAL4_AOT_MISS (compiling on-device) key={key} name={name}");
+                }
                 if let Ok(dir) = std::env::var("METAL4_DUMP_MSL") {
                     dump_msl(&dir, &key, name, source);
                 }
