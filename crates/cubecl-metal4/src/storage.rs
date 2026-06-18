@@ -73,10 +73,20 @@ impl Metal4Storage {
     }
 
     fn perform_deallocations(&mut self) {
-        for id in self.deallocations.drain(..) {
-            // Dropping the `Buffer` releases the `Retained<MTLBuffer>`. The
-            // residency-set registration is dropped with it on Metal's side.
-            self.memory.remove(&id);
+        let ids: Vec<_> = self.deallocations.drain(..).collect();
+        let mut removed = false;
+        for id in ids {
+            if let Some(buf) = self.memory.remove(&id) {
+                // `addAllocation:` retained this buffer in the queue residency
+                // set; remove it BEFORE dropping `buf`, or the set grows
+                // unbounded (→ `addAllocation:` abort) and the buffer never frees.
+                self.ctx.free_allocation(&buf);
+                removed = true;
+            }
+        }
+        // Residency-set edits only take effect on commit; do it once per batch.
+        if removed {
+            self.ctx.commit_residency();
         }
     }
 

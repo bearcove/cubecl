@@ -337,6 +337,22 @@ impl Metal4 {
         Buffer { raw, len }
     }
 
+    /// Remove a buffer's allocation from the queue residency set. MUST be called
+    /// before the `Buffer` is dropped: `addAllocation:` RETAINS the allocation, so
+    /// without this the set grows unbounded (every transient tensor leaks into it)
+    /// until `-[IOGPUMetalResidencySet addAllocation:]` aborts — and the buffers
+    /// never actually free. Caller should `commit_residency` after a batch of
+    /// removals (residency-set edits only take effect on commit).
+    pub fn free_allocation(&self, buf: &Buffer) {
+        let alloc: &ProtocolObject<dyn MTLAllocation> = ProtocolObject::from_ref(&*buf.raw);
+        self.residency_set.removeAllocation(alloc);
+    }
+
+    /// Commit pending residency-set edits (after a batch of `free_allocation`).
+    pub fn commit_residency(&self) {
+        self.residency_set.commit();
+    }
+
     /// Allocate a buffer initialized from `data`.
     pub fn buffer_from<T: Copy>(&self, data: &[T]) -> Buffer {
         let buf = self.alloc(core::mem::size_of_val(data));
