@@ -149,6 +149,27 @@ where
             return execute_with_fallback(&operations, fastest_index, inputs);
         }
 
+        // Frozen mode: never benchmark. Resolve the (shipped) cache to a definitive
+        // state and HARD-ERROR on anything that isn't a hit. The panic carries the full
+        // key, tuner name, and resolved state so a miss tells us *exactly* what the
+        // shipped table was missing — that key can then be captured and added.
+        if tuner.is_frozen() {
+            let resolved = tuner.fastest_frozen(&key, || operations.compute_checksum());
+            if let TuneCacheResult::Hit { fastest_index } = resolved {
+                #[cfg(feature = "autotune-checks")]
+                self.checks::<I, Out>(&operations, &inputs);
+                return execute_with_fallback(&operations, fastest_index, inputs);
+            }
+            panic!(
+                "frozen autotune miss: no shipped table entry for this key (benchmarking is \
+                 disabled).\n  tuner = {}\n  device = {id}\n  key   = {key}\n  state = {resolved:?}\n\
+                 The shipped autotune table is missing this key, or its checksum no longer \
+                 matches the compiled kernels. Capture this key on this device with autotune \
+                 enabled and ship the updated table.",
+                self.name,
+            );
+        }
+
         let fastest = tuner.check_tune::<R, I, Out>(
             &key,
             &inputs,

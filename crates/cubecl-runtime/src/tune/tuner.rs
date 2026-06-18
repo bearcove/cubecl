@@ -25,6 +25,8 @@ use super::{AutotuneKey, AutotuneOutput, TunableSet, TuneCacheResult, TuneInputs
 pub struct Tuner<K: AutotuneKey> {
     cache: Arc<spin::Mutex<TuneCache<K>>>,
     logger: Arc<spin::Mutex<Logger>>,
+    /// When true, never benchmark: resolve a definitive cache state and hard-error on a miss.
+    frozen: bool,
 }
 
 /// The measured outcome for a given autotune invocation.
@@ -120,15 +122,53 @@ impl<K: AutotuneKey> Tuner<K> {
     /// Create a tuner. Its cache is seeded from the persistent on-disk cache when
     /// `std_io` is enabled.
     pub fn new(name: &str, device_id: &str) -> Self {
+        let frozen = {
+            #[cfg(std_io)]
+            {
+                use crate::config::RuntimeConfig;
+                crate::config::CubeClRuntimeConfig::get().autotune.frozen
+            }
+            #[cfg(not(std_io))]
+            {
+                false
+            }
+        };
         Self {
             cache: Arc::new(spin::Mutex::new(TuneCache::new(name, device_id))),
             logger: Arc::new(spin::Mutex::new(Logger::new())),
+            frozen,
         }
+    }
+
+    /// Whether this tuner is in frozen mode (read-only cache, hard-error on miss).
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
     }
 
     /// Fetch the fastest autotune operation index for an autotune key.
     pub fn fastest(&self, key: &K) -> TuneCacheResult {
         self.cache.lock().fastest(key)
+    }
+
+    /// Resolve the cache to a DEFINITIVE state without ever benchmarking, used by frozen
+    /// mode. A freshly-loaded persistent entry is `Unchecked` until its checksum is
+    /// compared against the compiled kernels; do that comparison here (it's a cheap
+    /// string compare, no GPU work) so the caller gets a real `Hit`/`Miss`.
+    pub fn fastest_frozen(
+        &self,
+        key: &K,
+        #[cfg_attr(not(std_io), allow(unused))] checksum: impl FnOnce() -> String,
+    ) -> TuneCacheResult {
+        let mut cache = self.cache.lock();
+        let cur = cache.fastest(key);
+
+        #[cfg(std_io)]
+        if matches!(cur, TuneCacheResult::Unchecked) {
+            let checksum = checksum();
+            return cache.validate_checksum(key, &checksum);
+        }
+
+        cur
     }
 
     /// Check the cache, validate checksums if needed, and kick off a tuning job if the

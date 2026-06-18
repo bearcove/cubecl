@@ -326,6 +326,16 @@ impl Metal4 {
     ///   lifetime (Apple-silicon page size is 16 KB; `len` is rounded up to it).
     /// - The region must outlive every dispatch that binds this buffer.
     pub unsafe fn alloc_no_copy(&self, ptr: *mut u8, len: usize) -> Buffer {
+        // A/B knob (METAL4_FORCE_COPY=1): copy the bytes into a fresh Metal-owned
+        // buffer instead of wrapping the caller's mmap pages. Isolates whether the
+        // cold first-use cost is the GPU wiring/residency of file-backed no-copy
+        // pages (copy → Metal-owned, pre-resident) vs something else.
+        if std::env::var("METAL4_FORCE_COPY").is_ok() {
+            let buf = self.alloc(len);
+            let src = unsafe { core::slice::from_raw_parts(ptr, len) };
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf.raw.contents().as_ptr() as *mut u8, len) };
+            return buf;
+        }
         const PAGE: usize = 16 * 1024;
         let padded = len.div_ceil(PAGE) * PAGE;
         let raw = unsafe {

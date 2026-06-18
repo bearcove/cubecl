@@ -13,6 +13,19 @@ pub struct AutotuneConfig {
     #[serde(default)]
     pub level: AutotuneLevel,
 
+    /// Frozen mode: never benchmark. Read the (shipped) cache, pick the cached
+    /// fastest index, and HARD-ERROR on any key that is missing or whose checksum
+    /// no longer matches the compiled kernels.
+    ///
+    /// This exists for shipped applications — notably iOS, where the sandbox makes
+    /// the persistent autotune cache effectively non-writable, so a normal
+    /// (autotuning) build re-benchmarks every kernel on every cold launch (~20 s).
+    /// A frozen build ships a captured table and refuses to benchmark, so the first
+    /// dictation is fast and any table/binary skew fails loudly instead of silently
+    /// re-tuning.
+    #[serde(default)]
+    pub frozen: bool,
+
     /// Cache location for storing autotune results.
     #[serde(default)]
     #[cfg(std_io)]

@@ -139,6 +139,25 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             self.streaming.max_streams = n;
         }
 
+        // Pin the autotune + compilation caches to an explicit, WRITABLE root.
+        // The default `Target` config searches for a Cargo.toml then falls back to
+        // a platform cache dir — which on a sandboxed iOS app does not resolve to a
+        // persistent, writable location, so autotune results are never saved and
+        // every launch re-benchmarks from scratch (~20 s cold). An app sets
+        // CUBECL_CACHE_ROOT to a dir inside its container so the cache survives.
+        if let Ok(root) = std::env::var("CUBECL_CACHE_ROOT") {
+            let cfg = crate::config::cache::CacheConfig::File(root.into());
+            self.autotune.cache = cfg.clone();
+            self.compilation.cache = Some(cfg);
+        }
+
+        // Frozen autotune: read the shipped cache and HARD-ERROR on a miss instead
+        // of benchmarking. Pair with CUBECL_CACHE_ROOT pointing at the bundled,
+        // read-only table.
+        if let Ok(val) = std::env::var("CUBECL_AUTOTUNE_FROZEN") {
+            self.autotune.frozen = matches!(val.as_str(), "1" | "true");
+        }
+
         self
     }
 }
