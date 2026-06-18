@@ -227,7 +227,13 @@ impl Metal4 {
 
         let desc = MTLResidencySetDescriptor::new();
         desc.setLabel(Some(&NSString::from_str("cubecl.metal4.residency")));
-        unsafe { desc.setInitialCapacity(128) };
+        // The set is effectively fixed-size at this capacity — `addAllocation:`
+        // aborts past it (NOT a graceful grow). 128 only covered inference; a
+        // training backward holds its whole graph's intermediates resident at
+        // once (thousands of buffers), so size for the peak working set.
+        // `free_allocation` (removeAllocation on dealloc) keeps it from growing
+        // across iterations, so this bounds peak-live, not lifetime-total.
+        unsafe { desc.setInitialCapacity(1 << 18) };
         let residency_set = device
             .newResidencySetWithDescriptor_error(&desc)
             .map_err(|e| format!("device did not create an MTLResidencySet: {e}"))?;
