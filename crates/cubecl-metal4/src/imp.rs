@@ -677,9 +677,17 @@ impl Metal4 {
         // a GPU span on commit. Only when a stax recording is live.
         if let Some((begin, end)) = stax_idx {
             if crate::stax_lane::reporting_active() {
+                // Enrich the span label with the launch geometry (grid groups ·
+                // threads-per-group). The entry name alone can't tell an audio-
+                // encoder matmul from a decode matmul (same kernel, different
+                // problem shape); the grid does — so they split in stax `top`.
+                let labelled = format!(
+                    "{label} <{}x{}x{}·{}x{}x{}>",
+                    groups.0, groups.1, groups.2, threads.0, threads.1, threads.2,
+                );
                 batch
                     .spans
-                    .push((label.to_string(), begin, end, crate::stax_lane::capture_origin()));
+                    .push((labelled, begin, end, crate::stax_lane::capture_origin()));
             }
         }
         Ok(())
