@@ -670,11 +670,19 @@ impl CudaServer {
             .compilation_options
             .supports_features
             .grid_constants;
+        // Enforce stream health BEFORE resolving+launching. If a prior op (e.g. an
+        // autotune candidate's output reservation) hit OOM and poisoned the stream,
+        // we must NOT launch this kernel against its (never-allocated) bindings —
+        // doing so turns a recoverable OOM into a STICKY CUDA illegal-address that no
+        // error flush can clear, cascading into a process-killing fence panic. Aborting
+        // here keeps the failure a recoverable error so the autotuner skips the
+        // candidate (and the warmup `client.flush()` recovers the stream). Healthy
+        // streams are unaffected.
         let mut command = self.command(
             stream_id,
             bindings.buffers.iter(),
             StreamErrorMode {
-                ignore: true,
+                ignore: false,
                 flush: false,
             },
         )?;
