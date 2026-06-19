@@ -84,6 +84,12 @@ pub struct QuantScheme {
     pub level: QuantLevel,
     /// Quantization mode (e.g., symmetric).
     pub mode: QuantMode,
+    /// Activation-side rotation applied before the contraction. The weights are
+    /// stored pre-rotated; the forward transform is folded onto the activation at
+    /// matmul time (so the quant-matmul stays a single fusable op rather than a
+    /// separate rotation op + a custom barrier). Defaults to [`Rotation::None`],
+    /// preserving every existing scheme's behavior.
+    pub rotation: Rotation,
 }
 
 impl Default for QuantScheme {
@@ -94,8 +100,28 @@ impl Default for QuantScheme {
             store: QuantStore::PackedU32(0),
             level: QuantLevel::Tensor,
             mode: QuantMode::Symmetric,
+            rotation: Rotation::None,
         }
     }
+}
+
+/// Activation-side rotation folded into the quant-matmul. The sign table is
+/// canonical/deterministic (resolved at codegen, like [`codebook_for`]), so the
+/// scheme only carries WHICH rotation and the block size — no per-scheme data.
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub enum Rotation {
+    /// No rotation (the default — plain dequantize-and-matmul).
+    #[default]
+    None,
+    /// Forward random-Hadamard transform (RHT) applied to each `block`-sized span
+    /// of the activation before the contraction. Mirrors bee's `matvec_prerot`:
+    /// weights are stored rotated, the activation is rotated in-kernel.
+    Rht {
+        /// Hadamard block size (e.g. 32).
+        block: u32,
+    },
 }
 
 impl QuantScheme {
@@ -126,6 +152,12 @@ impl QuantScheme {
     /// Set the precision used for quantization parameters
     pub fn with_param(mut self, param: QuantParam) -> Self {
         self.param = param;
+        self
+    }
+
+    /// Set the activation-side rotation folded into the quant-matmul.
+    pub fn with_rotation(mut self, rotation: Rotation) -> Self {
+        self.rotation = rotation;
         self
     }
 

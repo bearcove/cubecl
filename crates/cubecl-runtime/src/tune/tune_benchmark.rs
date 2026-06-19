@@ -1,6 +1,7 @@
 use super::{AutotuneError, TuneFn, TuneInputs};
 use crate::{client::ComputeClient, runtime::Runtime};
-use alloc::string::ToString;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use cubecl_common::profile::ProfileDuration;
 
@@ -47,6 +48,7 @@ fn profile_exclusive<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
 
     let num_samples = 10;
     let mut durations = Vec::new();
+    let mut last_err = String::new();
 
     for _ in 0..num_samples {
         let result: Result<
@@ -69,11 +71,13 @@ fn profile_exclusive<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
             Ok((out, duration)) => match out {
                 Ok(_) => Some(duration),
                 Err(err) => {
+                    last_err = format!("{err}");
                     log::trace!("Error while autotuning {err}");
                     None
                 }
             },
             Err(err) => {
+                last_err = format!("{err}");
                 log::trace!("Error while autotuning {err}");
                 None
             }
@@ -87,6 +91,11 @@ fn profile_exclusive<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
     if durations.is_empty() {
         Err(AutotuneError::InvalidSamples {
             name: operation.name.to_string(),
+            reason: if last_err.is_empty() {
+                "no execute error recorded (profiling produced no samples)".to_string()
+            } else {
+                last_err
+            },
         })
     } else {
         Ok(durations)

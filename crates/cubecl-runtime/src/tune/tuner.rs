@@ -61,10 +61,15 @@ pub enum AutotuneError {
         err: String,
     },
     /// All samples are invalid.
-    #[display("{name}: All samples are invalid.")]
+    #[display("{name}: All samples are invalid. Reason: {reason}")]
     InvalidSamples {
         /// The name of the tunable.
         name: String,
+        /// Why every profiled sample failed (the execute/launch error). Previously
+        /// swallowed into a `log::trace!`, invisible without a log subscriber — now
+        /// surfaced through the autotune logger so a candidate's rejection reason is
+        /// observable via `CUBECL_DEBUG_LOG`.
+        reason: String,
     },
     /// No autotune was flagged as valid for the problem.
     ///
