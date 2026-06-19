@@ -64,7 +64,7 @@ objc2-metal = { version = "0.3.2", features = [
 block2 = "0.6"
 # Optional: report per-dispatch GPU timestamps to a stax target lane (the `stax`
 # feature). Path dep to Amos's stax checkout; only linked when the feature is on.
-stax-target = { path = "../../../stax/stax-target", optional = true }
+stax-target = { path = "../../../../oss/stax/stax-target", optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 # `export_tests` exposes cubecl's golden-vector kernel suite (reduce, softmax,

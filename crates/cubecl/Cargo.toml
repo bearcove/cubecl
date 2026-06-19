@@ -50,6 +50,9 @@ hip-rocwmma = ["cubecl-hip?/rocwmma"]
 metal = ["wgpu-msl"]
 # Native Metal 4 runtime (Apple only; empty elsewhere).
 metal4 = ["cubecl-metal4"]
+# Report per-dispatch Metal 4 counter-heap timestamps to a stax target lane.
+# Weak-forwards to cubecl-metal4 so it only links when metal4 is also enabled.
+stax = ["cubecl-metal4?/stax"]
 rocm = ["hip"]
 spirv-dump = ["cubecl-wgpu/spirv-dump"]
 vulkan = ["wgpu-spirv"]
