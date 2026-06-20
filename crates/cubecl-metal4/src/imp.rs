@@ -393,6 +393,17 @@ impl Metal4 {
                     dump_msl(&dir, &key, name, source);
                 }
                 let opts = MTLCompileOptions::new();
+                // Source-level GPU profiling (per-line Cost Graph / AGXPS instruction
+                // cost) needs the runtime-compiled library to carry debug line-tables.
+                // Public `MTLCompileOptions` has no flag, but the concrete
+                // `MTLCompileOptionsInternal` exposes the private `setDebuggingEnabled:`
+                // selector. Opt in via `METAL4_SHADER_DEBUG` so normal runs pay no
+                // extra compile cost / binary size.
+                if std::env::var("METAL4_SHADER_DEBUG").is_ok() {
+                    unsafe {
+                        let _: () = objc2::msg_send![&*opts, setDebuggingEnabled: true];
+                    }
+                }
                 self.device
                     .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
                     .map_err(|e| format!("MSL compile failed: {e}"))?
