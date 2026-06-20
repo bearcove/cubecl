@@ -63,7 +63,7 @@ ahash = { version = "0.8.12", default-features = false }
 md5 = { workspace = true }
 
 # Persistent cache deps - has to match the cfg(std_io) cfg.
-[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android", target_os = "ios"))'.dependencies]
 cubecl-common = { path = "../cubecl-common", version = "=0.11.0-pre.1", default-features = false, features = [
     "cache",
     "serde",

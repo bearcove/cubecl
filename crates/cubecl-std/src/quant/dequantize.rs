@@ -23,8 +23,9 @@ pub fn dequantize_aligned<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF:
             QuantStore::PackedU32(_) => {
                 unpack_cast_u32::<F, NQ, NF>(Vector::cast_from(value), scheme)
             }
-            // Dense packing only occurs with codebook schemes (handled above).
-            QuantStore::PackedU32Dense(_) => panic!("dense packing requires a codebook scheme"),
+            // Symmetric dense: codes are two's-complement signed values,
+            // densely bit-packed (same layout as the codebook path), no LUT.
+            QuantStore::PackedU32Dense(_) => unpack_signed_dense::<Q, F, NQ, NF>(value, scheme),
         };
         let scale = Vector::<F, NF>::cast_from(scale);
         q_values * scale
@@ -71,6 +72,39 @@ fn dequantize_codebook<Q: Scalar, S: CubePrimitive, F: Numeric, NQ: Size, NF: Si
             lo & mask
         };
         out.insert(j, F::cast_from(lut[raw as usize]) * scale.extract(j));
+    }
+    out
+}
+
+/// Symmetric dense unpack: each `size_bits`-wide code is a two's-complement
+/// signed value, densely bit-packed (`PackedU32Dense`, same bit layout as the
+/// codebook path) and may straddle a u32 word. Returns the (unscaled) signed
+/// values; the caller multiplies by the per-unit scale. No centroid table.
+#[cube]
+fn unpack_signed_dense<Q: Scalar, F: Numeric, NQ: Size, NF: Size>(
+    value: Vector<Q, NQ>,
+    #[comptime] scheme: QuantScheme,
+) -> Vector<F, NF> {
+    let words = Vector::<u32, NQ>::cast_from(value);
+    let bits = comptime!(scheme.size_bits_value());
+    let mask = comptime!((1u32 << bits) - 1);
+    let sign_bit = comptime!(1u32 << (bits - 1));
+    let two_pow = comptime!(1i32 << bits);
+    let num = comptime!(scheme.num_quants());
+
+    let mut out = Vector::<F, NF>::empty();
+    #[unroll]
+    for j in 0..num {
+        let word = comptime!((j * bits) / 32);
+        let bitoff = comptime!((j * bits) % 32);
+        let lo = words.extract(word) >> comptime!(bitoff as u32);
+        let raw = if comptime!(bitoff + bits > 32) {
+            (lo | (words.extract(word + 1) << comptime!((32 - bitoff) as u32))) & mask
+        } else {
+            lo & mask
+        };
+        let neg = i32::cast_from(raw >= sign_bit);
+        out.insert(j, F::cast_from(i32::cast_from(raw) - neg * two_pow));
     }
     out
 }
