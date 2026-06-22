@@ -268,8 +268,8 @@ impl<'a, E: Numeric, N: Size, C: Coordinates + 'static> RunWithQuantType
         // `NF / num_quants` is the number of dense units in the load; each unit
         // occupies `storage_words_per_unit` u32 words (3 for 6-bit dense, where
         // the naive `NF / num_quants` would give 1 and read out of bounds).
-        let vector_size_q = (vector_size / self.scheme.num_quants())
-            * self.scheme.storage_words_per_unit();
+        let vector_size_q =
+            (vector_size / self.scheme.num_quants()) * self.scheme.storage_words_per_unit();
         self.builder.scope.register_size::<NQ>(vector_size_q);
 
         let values = View::<Vector<Q, NQ>, C>::expand(self.values, self.builder);

@@ -15,8 +15,9 @@ use cubecl_core::{
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
 };
 use cubecl_cpp::{
-    DialectWmmaCompiler, register_supported_types,
+    DialectWmmaCompiler,
     metal::{MslDialect, arch::MetalArchitecture},
+    register_supported_types,
     shared::{CompilationOptions, register_wmma_features},
 };
 use cubecl_runtime::{allocator::ContiguousMemoryLayoutPolicy, logging::ServerLogger};
@@ -51,7 +52,11 @@ impl DeviceService for Metal4Server {
         // (like CUDA's WMMA) instead of only the scalar unit/vecmat/naive ones,
         // which mishandle the packed-u32 codebook lhs under fusion (cast.rs:28).
         let wmma_combinations = MslDialect::supported_wmma_combinations(&MetalArchitecture::Metal3);
-        let min_tensor_cores_dim = if wmma_combinations.is_empty() { None } else { Some(8) };
+        let min_tensor_cores_dim = if wmma_combinations.is_empty() {
+            None
+        } else {
+            Some(8)
+        };
 
         let topology = HardwareProperties {
             load_width: 128,

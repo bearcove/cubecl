@@ -79,7 +79,11 @@ fn cube_batching_proof() {
     let commits = global_commit_count() - commits_before;
 
     for (i, &b) in base.iter().enumerate() {
-        assert_eq!(out[i], b + iters as f32, "elem {i}: dependency/barrier broken");
+        assert_eq!(
+            out[i],
+            b + iters as f32,
+            "elem {i}: dependency/barrier broken"
+        );
     }
     assert!(
         commits < iters as u64,

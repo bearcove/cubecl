@@ -14,8 +14,8 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap,
-    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity, MTL4VisibilityOptions,
-    MTLAllocation, MTLBuffer, MTLCompileOptions, MTLComputePipelineState,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity,
+    MTL4VisibilityOptions, MTLAllocation, MTLBuffer, MTLCompileOptions, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResidencySet,
     MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStages,
 };
@@ -333,18 +333,25 @@ impl Metal4 {
         if std::env::var("METAL4_FORCE_COPY").is_ok() {
             let buf = self.alloc(len);
             let src = unsafe { core::slice::from_raw_parts(ptr, len) };
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), buf.raw.contents().as_ptr() as *mut u8, len) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    buf.raw.contents().as_ptr() as *mut u8,
+                    len,
+                )
+            };
             return buf;
         }
         const PAGE: usize = 16 * 1024;
         let padded = len.div_ceil(PAGE) * PAGE;
         let raw = unsafe {
-            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
-                NonNull::new(ptr as *mut c_void).expect("alloc_no_copy: null ptr"),
-                padded,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            )
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    NonNull::new(ptr as *mut c_void).expect("alloc_no_copy: null ptr"),
+                    padded,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
         }
         .expect("newBufferWithBytesNoCopy failed (ptr must be page-aligned)");
         // Residency declared per command buffer at bind time (see `batch_dispatch`).
@@ -422,16 +429,16 @@ impl Metal4 {
             let pso_ms = t1.elapsed().as_secs_f32() * 1e3;
             eprintln!("METAL4_COMPILE lib_ms={lib_ms:.1} pso_ms={pso_ms:.1} name={name}");
         }
-        Ok(Pipeline { state, name: name.to_string() })
+        Ok(Pipeline {
+            state,
+            name: name.to_string(),
+        })
     }
 
     /// Load a precompiled `<METAL4_METALLIB_DIR>/<key>.metallib` if present, else
     /// `None` (fall back to on-device source compile). The dir is the app bundle's
     /// shipped kernel cache on iOS.
-    fn try_load_metallib(
-        &self,
-        key: &str,
-    ) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    fn try_load_metallib(&self, key: &str) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
         let dir = std::env::var("METAL4_METALLIB_DIR").ok()?;
         let path = resolve_dir(&dir).join(format!("{key}.metallib"));
         if !path.exists() {
@@ -459,8 +466,10 @@ impl Metal4 {
         threads: (u32, u32, u32),
     ) -> Result<(), String> {
         let addrs: Vec<u64> = bindings.iter().map(|b| b.gpu_address()).collect();
-        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> =
-            bindings.iter().map(|b| ProtocolObject::from_ref(&*b.raw)).collect();
+        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> = bindings
+            .iter()
+            .map(|b| ProtocolObject::from_ref(&*b.raw))
+            .collect();
         self.dispatch_inner(pipeline, &addrs, &residents, groups, threads, None)
     }
 
@@ -481,16 +490,28 @@ impl Metal4 {
             .device
             .newCounterHeapWithDescriptor_error(&desc)
             .map_err(|e| format!("counter heap creation failed: {e}"))?;
-        unsafe { heap.invalidateCounterRange(NSRange { location: 0, length: 2 }) };
+        unsafe {
+            heap.invalidateCounterRange(NSRange {
+                location: 0,
+                length: 2,
+            })
+        };
 
         let addrs: Vec<u64> = bindings.iter().map(|b| b.gpu_address()).collect();
-        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> =
-            bindings.iter().map(|b| ProtocolObject::from_ref(&*b.raw)).collect();
+        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> = bindings
+            .iter()
+            .map(|b| ProtocolObject::from_ref(&*b.raw))
+            .collect();
         self.dispatch_inner(pipeline, &addrs, &residents, groups, threads, Some(&heap))?;
 
         // Resolve the two timestamps and convert ticks → ns.
-        let data = unsafe { heap.resolveCounterRange(NSRange { location: 0, length: 2 }) }
-            .ok_or("timestamp resolve returned no data")?;
+        let data = unsafe {
+            heap.resolveCounterRange(NSRange {
+                location: 0,
+                length: 2,
+            })
+        }
+        .ok_or("timestamp resolve returned no data")?;
         let mut bytes = vec![0u8; data.length()];
         if !bytes.is_empty() {
             unsafe {
@@ -574,7 +595,12 @@ impl Metal4 {
                 .device
                 .newCounterHeapWithDescriptor_error(&desc)
                 .map_err(|e| format!("counter heap creation failed: {e}"))?;
-            unsafe { heap.invalidateCounterRange(NSRange { location: 0, length: cap }) };
+            unsafe {
+                heap.invalidateCounterRange(NSRange {
+                    location: 0,
+                    length: cap,
+                })
+            };
             (Some(heap), cap)
         } else {
             (None, 0)
@@ -710,9 +736,12 @@ impl Metal4 {
         if entries == 0 {
             return;
         }
-        let Some(data) =
-            (unsafe { heap.resolveCounterRange(NSRange { location: 0, length: entries }) })
-        else {
+        let Some(data) = (unsafe {
+            heap.resolveCounterRange(NSRange {
+                location: 0,
+                length: entries,
+            })
+        }) else {
             return;
         };
         let mut bytes = vec![0u8; data.length()];
@@ -755,9 +784,12 @@ impl Metal4 {
             Some(m) => m as usize + 1,
             None => return,
         };
-        let Some(data) =
-            (unsafe { heap.resolveCounterRange(NSRange { location: 0, length: entries }) })
-        else {
+        let Some(data) = (unsafe {
+            heap.resolveCounterRange(NSRange {
+                location: 0,
+                length: entries,
+            })
+        }) else {
             return;
         };
         let mut bytes = vec![0u8; data.length()];

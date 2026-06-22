@@ -22,9 +22,6 @@ use cubecl_core::{
     zspace::{Shape, Strides, strides},
 };
 use cubecl_cpp::shared::CompilationOptions;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLAllocation, MTLBuffer};
 use cubecl_runtime::{
     allocator::ContiguousMemoryLayoutPolicy,
     compiler::CubeTask,
@@ -43,6 +40,9 @@ use cubecl_runtime::{
     },
     timestamp_profiler::TimestampProfiler,
 };
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLAllocation, MTLBuffer};
 
 use crate::imp::{Batch, Buffer, Metal4, Pipeline};
 use crate::storage::{Metal4Resource, Metal4Storage};
@@ -52,7 +52,10 @@ pub type Metal4Compiler = cubecl_cpp::MslCompiler;
 /// One scheduled task on a Metal 4 stream.
 pub enum ScheduleTask {
     /// Host → unified-memory upload into an already-resolved resource.
-    Write { resource: Metal4Resource, data: Bytes },
+    Write {
+        resource: Metal4Resource,
+        data: Bytes,
+    },
     /// A compiled kernel ready to encode into the open batch.
     Execute {
         pipeline: Arc<Pipeline>,
@@ -167,11 +170,15 @@ impl Metal4Stream {
         // buffer's own residency set (raw `gpuAddress` argument tables carry no
         // implicit residency). Retained clones are cheap and keep the buffers
         // alive across the dispatch.
-        let mut alloc_holders: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> =
-            bindings.resources.iter().map(|r| r.allocation.clone()).collect();
+        let mut alloc_holders: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> = bindings
+            .resources
+            .iter()
+            .map(|r| r.allocation.clone())
+            .collect();
         if !bindings.info.data.is_empty() {
-            let info_buf =
-                self.ctx.buffer_from(bytemuck::cast_slice::<u64, u8>(&bindings.info.data));
+            let info_buf = self
+                .ctx
+                .buffer_from(bytemuck::cast_slice::<u64, u8>(&bindings.info.data));
             addresses.push(info_buf.gpu_address());
             alloc_holders.push(info_buf.retained());
             self.transient.push(info_buf);
@@ -179,8 +186,10 @@ impl Metal4Stream {
         // Pin the bound pool slices until this batch commits (see BindingsResource).
         self.in_flight.extend(bindings.handles);
 
-        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> =
-            alloc_holders.iter().map(|b| ProtocolObject::from_ref(&**b)).collect();
+        let residents: Vec<&ProtocolObject<dyn MTLAllocation>> = alloc_holders
+            .iter()
+            .map(|b| ProtocolObject::from_ref(&**b))
+            .collect();
 
         if self.batch.is_none() {
             self.batch = Some(self.ctx.open_batch()?);
@@ -273,8 +282,11 @@ impl Metal4Stream {
     }
 
     pub fn get_resource(&mut self, binding: Binding) -> Result<Metal4Resource, IoError> {
-        self.memory_management
-            .get_resource(binding.memory, binding.offset_start, binding.offset_end)
+        self.memory_management.get_resource(
+            binding.memory,
+            binding.offset_start,
+            binding.offset_end,
+        )
     }
 
     /// Synchronous read: commit pending work, then view the resolved resource's
@@ -511,7 +523,11 @@ impl ComputeServer for Metal4Server {
         self.utilities.clone()
     }
 
-    fn staging(&mut self, _sizes: &[usize], _stream_id: StreamId) -> Result<Vec<Bytes>, ServerError> {
+    fn staging(
+        &mut self,
+        _sizes: &[usize],
+        _stream_id: StreamId,
+    ) -> Result<Vec<Bytes>, ServerError> {
         Err(IoError::UnsupportedIoOperation {
             backtrace: BackTrace::capture(),
         }
@@ -533,8 +549,12 @@ impl ComputeServer for Metal4Server {
         let stream = self.scheduler.stream(&stream_id);
         // Wrap the caller's (mmap'd) memory as a no-copy MTLBuffer, register it as a
         // foreign storage entry, and hand back a handle that lives outside the pools.
-        let storage_handle =
-            unsafe { stream.memory_management.storage_mut().register_external(ptr as *mut u8, len) };
+        let storage_handle = unsafe {
+            stream
+                .memory_management
+                .storage_mut()
+                .register_external(ptr as *mut u8, len)
+        };
         stream.memory_management.reserve_external(storage_handle)
     }
 

@@ -17,11 +17,11 @@ use cubecl_metal4::{Metal4Runtime, set_dispatch_timing, take_dispatch_ns};
 /// 16-entry LUT, multiplies by the activation, and the warp `plane_sum`s.
 #[cube(launch_unchecked)]
 fn qa_gemv<F: Float>(
-    a: &[F],          // [K] activation (M = 1)
-    w_codes: &[u32],  // [N, K] dense 4-bit codes (8 per u32, code j at bit 4j)
-    w_scales: &[F],   // [N, K/16] per-16 scale
-    lut: &[F],        // 16 centroids
-    out: &mut [F],    // [N]
+    a: &[F],         // [K] activation (M = 1)
+    w_codes: &[u32], // [N, K] dense 4-bit codes (8 per u32, code j at bit 4j)
+    w_scales: &[F],  // [N, K/16] per-16 scale
+    lut: &[F],       // 16 centroids
+    out: &mut [F],   // [N]
     #[comptime] k: u32,
 ) {
     let lane = UNIT_POS_PLANE;
@@ -74,9 +74,13 @@ fn qa_gemv_parity() {
         s ^= s << 17;
         s
     };
-    let a: Vec<f32> = (0..k).map(|_| (next() % 1000) as f32 / 500.0 - 1.0).collect();
+    let a: Vec<f32> = (0..k)
+        .map(|_| (next() % 1000) as f32 / 500.0 - 1.0)
+        .collect();
     let codes_u8: Vec<u8> = (0..n * k).map(|_| (next() % 16) as u8).collect();
-    let scales: Vec<f32> = (0..n * units).map(|_| 0.2 + (next() % 800) as f32 / 1000.0).collect();
+    let scales: Vec<f32> = (0..n * units)
+        .map(|_| 0.2 + (next() % 800) as f32 / 1000.0)
+        .collect();
 
     // Pack codes: 8 nibbles per u32, code j at bit 4j (per cubek dense layout).
     let mut codes = vec![0u32; n * k / 8];

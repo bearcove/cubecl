@@ -136,7 +136,9 @@ impl ComputeServer for CudaServer {
                 // repeated failed attempts (in_use/reserved should NOT climb).
                 if std::env::var("CUBECL_MEM_DEBUG").is_ok() {
                     let u = command.memory_usage();
-                    let free = cudarc::driver::result::mem_get_info().ok().map(|(f, t)| (f, t));
+                    let free = cudarc::driver::result::mem_get_info()
+                        .ok()
+                        .map(|(f, t)| (f, t));
                     eprintln!(
                         "[cubecl-cuda] reserve({size}) FAILED ({err}); pool in_use={} reserved={} allocs={}; gpu (free,total)={:?}",
                         u.bytes_in_use, u.bytes_reserved, u.number_allocs, free

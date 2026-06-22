@@ -104,10 +104,12 @@ impl DeviceService for CudaServer {
         // 8 GiB so `max_page` is never absurdly small.
         // SAFETY: `device_ptr` is a valid device handle from `device::get`.
         const GIB: u64 = 1024 * 1024 * 1024;
-        let by_total =
-            unsafe { cudarc::driver::result::device::total_mem(device_ptr) }.ok().map(|b| b as u64);
-        let by_info =
-            cudarc::driver::result::mem_get_info().ok().map(|(_free, total)| total as u64);
+        let by_total = unsafe { cudarc::driver::result::device::total_mem(device_ptr) }
+            .ok()
+            .map(|b| b as u64);
+        let by_info = cudarc::driver::result::mem_get_info()
+            .ok()
+            .map(|(_free, total)| total as u64);
         let max_memory = [by_total, by_info]
             .iter()
             .filter_map(|o| *o)

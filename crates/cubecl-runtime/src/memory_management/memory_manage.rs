@@ -455,10 +455,13 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
 
         if id.location().pool == EXTERNAL_POOL {
             let slice = id.location().slice as usize;
-            return self.external_slices.get(slice).ok_or_else(|| IoError::NotFound {
-                backtrace: BackTrace::capture(),
-                reason: format!("External slice {slice} doesn't exist").into(),
-            });
+            return self
+                .external_slices
+                .get(slice)
+                .ok_or_else(|| IoError::NotFound {
+                    backtrace: BackTrace::capture(),
+                    reason: format!("External slice {slice} doesn't exist").into(),
+                });
         }
 
         if id.location().pool >= self.pools.len() as u8 {

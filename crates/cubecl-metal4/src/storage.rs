@@ -100,7 +100,13 @@ impl Metal4Storage {
         let id = StorageId::new();
         let buffer = unsafe { self.ctx.alloc_no_copy(ptr, len) };
         self.memory.insert(id, buffer);
-        StorageHandle::new(id, StorageUtilization { offset: 0, size: len as u64 })
+        StorageHandle::new(
+            id,
+            StorageUtilization {
+                offset: 0,
+                size: len as u64,
+            },
+        )
     }
 }
 
